@@ -7,6 +7,9 @@ Salty is a lightweight, high-performance command-line utility written in V for s
 - **Dual-Stream Steganography**:
     - **Numeric Mode**: Conceals data as international phone numbers, credit card sequences, or routing numbers.
     - **Text Mode (Typo Steganography)**: Embeds data by injecting deterministic "typos" into a cover text based on physical keyboard layouts.
+- **Insertion vs. Overwrite Modes**: 
+    - *Insertion (Default)*: Adds typo characters next to the original ones.
+    - *Overwrite (`-o`)*: Replaces original characters with typos, maintaining the exact string length for maximum stealth.
 - **Industrial-Grade Compression**: Payloads are pre-processed with Zstandard (zstd) at level 19 for maximum data density.
 - **Authenticated Encryption**: Powered by OpenSSL ChaCha20-Poly1305 with PBKDF2 key stretching.
 - **Keyboard Proximity Engine**: Features built-in **QWERTY** logic and supports **Custom Keymaps** (e.g., QWERTZ, AZERTY, or Dvorak) for realistic noise generation.
@@ -40,7 +43,7 @@ Run `salty` without arguments for a secure, guided experience with hidden passwo
 
 ### 2. Command-Line Mode
 
-#### Method A: Numeric Obfuscation (Numbers)
+#### Method A: Numeric Obfuscation (Fake Numbers)
 **Encryption:**
 ```bash
 ./salty encrypt -m "Confidential Data" -p "StrongPass" -s 9988 -f "+1202:7,411111:10"
@@ -55,40 +58,46 @@ Run `salty` without arguments for a secure, guided experience with hidden passwo
 #### Method B: Textual Steganography (Typo Injection)
 This method hides data by simulating human typing errors. It is highly resistant to automated detection.
 
-**Encryption:**
+**Mode 1: Insertion (Adds typos next to original letters)**
 ```bash
-./salty encrypt -m "Secret message" -p "Pass123" -s 550 -ti 25 -q -t "The report will be ready by tomorrow morning at the office."
-```
-*Options:*
-- `-ti, --typo-intensity`: Percentage of typo density (e.g., `25`).
-- `-q, --qwerty`: Uses standard English keyboard proximity.
-- `-km, --key-map`: Use a custom layout (e.g., German QWERTZ: `"^1234567890ßqwertzuiopüasdfghjklöäyxcvbnm"`).
+# Encrypt
+./salty encrypt -m "Secret" -p "Pass123" -s 550 -ti 25 -q -t "The report will be ready by tomorrow."
 
-**Decryption:**
+# Decrypt
+./salty decrypt -t "The reporrt wilbl be rready bny tomorrrow." -p "Pass123" -s 550 -ti 25 -q
+```
+
+**Mode 2: Overwrite (Replaces letters - Maintains exact length)**
+*Note: Decrypting in Overwrite mode requires the original reference text (`-r`) to compare and extract the overwritten typos.*
 ```bash
-# Note: Use 'set +H' in Bash if the text contains '!'
-./salty decrypt -t "The reporrt wilbl be rready bny tomorrrow morninng..." -p "Pass123" -s 550 -ti 25 -q
+# Encrypt (add -o flag)
+./salty encrypt -m "Secret" -p "Pass123" -s 550 -ti 25 -q -o -t "The report will be ready by tomorrow."
+
+# Decrypt (requires -o and -r flags)
+./salty decrypt -t "Thw repnrt wisl bw rwady by tomnrrow." -r "The report will be ready by tomorrow." -p "Pass123" -s 550 -ti 25 -q -o
 ```
 
 ---
 
-## Technical Specifications
+## Technical Specifications / Flags
 
 | Flag | Long Flag | Purpose |
 | :--- | :--- | :--- |
 | `-m` | `--message` | The secret data to be encrypted |
 | `-t` | `--text` | Cover text (Enc) or Carrier text (Dec) |
+| `-r` | `--ref` | Original Reference text (Required for Decrypting Overwrite mode) |
 | `-p` | `--pass` | Cryptographic password |
-| `-s` | `--seed` | Deterministic LCG seed for reordering |
-| `-f` | `--formats` | Layouts for Number Mode (`prefix:length`) |
-| `-ti` | `--typo-intensity` | Typo frequency (1-100) |
+| `-s` | `--seed` | Deterministic RNG seed for positioning / shuffling |
+| `-f` | `--formats` | Layouts for Number Mode (e.g., `prefix:length`) |
+| `-ti` | `--typo-intensity` | Typo frequency percentage (1-100) |
 | `-km` | `--key-map` | Custom physical keyboard string map |
 | `-q` | `--qwerty` | Standard US-QWERTY proximity logic |
+| `-o` | `--overwrite` | Replaces characters instead of inserting them (Length preserved) |
 
 ---
 
 ## Why Salty?
-Unlike traditional steganography which hides data in images or audio (often detectable by file size changes), Salty hides data in **plain text**. A few typos in a long email, a Discord message, or a technical log look like a normal human error. The secret payload is mathematically woven into these "mistakes," making it invisible to the naked eye and difficult for AI filters to flag.
+Unlike traditional steganography which hides data in images or audio (often detectable by file size changes or metadata analysis), Salty hides data in **plain text**. A few typos in a long email, a Discord message, or a technical log look like a normal human error. The secret payload is mathematically woven into these "mistakes," making it invisible to the naked eye and difficult for AI filters or DLP (Data Loss Prevention) systems to flag.
 
 ## License
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
