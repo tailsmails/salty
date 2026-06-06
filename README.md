@@ -11,7 +11,7 @@ Salty is a lightweight, high-performance command-line utility written in V for s
     - *Insertion (Default)*: Adds typo characters next to the original ones.
     - *Overwrite (`-o`)*: Replaces original characters with typos, maintaining the exact string length for maximum stealth.
 - **Industrial-Grade Compression**: Payloads are pre-processed with Zstandard (zstd) at level 19 for maximum data density.
-- **Authenticated Encryption**: Powered by OpenSSL ChaCha20-Poly1305 with PBKDF2 key stretching.
+- **Authenticated Encryption**: Powered by OpenSSL ChaCha20 ~~-Poly1305~~ with PBKDF2 key stretching.
 - **Keyboard Proximity Engine**: Features built-in **QWERTY** logic and supports **Custom Keymaps** (e.g., QWERTZ, AZERTY, or Dvorak) for realistic noise generation.
 - **Mixed-Radix Encoding**: A mathematical approach to transform encrypted bits into specific typo choices, ensuring 100% error-free recovery.
 - **Process Stealth**: Sensitive keys are handled via environment variables to prevent leaking credentials in process lists (e.g., `ps aux`).
