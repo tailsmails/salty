@@ -7,8 +7,12 @@ struct LCG {
 }
 
 fn (mut rng LCG) next() u32 {
-	rng.state = rng.state * u64(6364136223846793005) + u64(1442695040888963407)
-	return u32(rng.state >> 32)
+	// PCG-like transformation for better distribution and less predictability than simple LCG
+	oldstate := rng.state
+	rng.state = oldstate * u64(6364136223846793005) + u64(1442695040888963407)
+	xorshifted := u32(((oldstate >> 18) ^ oldstate) >> 27)
+	rot := u32(oldstate >> 59)
+	return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
 }
 
 fn (mut rng LCG) intn(n int) int {
@@ -107,43 +111,150 @@ fn hex_to_bytes(hex_str string) ![]u8 {
 }
 
 fn openssl_encrypt(plaintext string, password string) !string {
-	tmp_plain := os.join_path(os.temp_dir(), 'plain_${os.getpid()}.txt')
-	tmp_comp := os.join_path(os.temp_dir(), 'comp_${os.getpid()}.zst')
-	tmp_enc := os.join_path(os.temp_dir(), 'enc_${os.getpid()}.bin')
+	// Generate a high-entropy ID for temporary files to prevent predictability
+	mut entropy_p := os.new_process('openssl')
+	entropy_p.set_args(['rand', '-hex', '16'])
+	entropy_p.run()
+	entropy_p.wait()
+	tmp_entropy := entropy_p.stdout_read().trim_space()
+	entropy_p.close()
+	tmp_id := '${os.getpid()}_${tmp_entropy}'
+
+	tmp_plain := os.path_abs(os.join_path(os.temp_dir(), 'salty_p_${tmp_id}.txt'))
+	tmp_comp := os.path_abs(os.join_path(os.temp_dir(), 'salty_c_${tmp_id}.zst'))
+	tmp_enc := os.path_abs(os.join_path(os.temp_dir(), 'salty_e_${tmp_id}.bin'))
+	tmp_key := os.path_abs(os.join_path(os.temp_dir(), 'salty_k_${tmp_id}.txt'))
+
+	// Atomic creation with 0600 permissions to prevent race conditions and symlink attacks
+	os.execute('python3 -c "import os, sys; [os.open(f, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600) for f in sys.argv[1:]]" "${tmp_plain}" "${tmp_comp}" "${tmp_enc}" "${tmp_key}"')
 
 	os.write_file(tmp_plain, plaintext)!
-	zstd_res := os.execute('zstd -19 -f ${tmp_plain} -o ${tmp_comp}')
+	zstd_res := os.execute('zstd -9 -f "${tmp_plain}" -o "${tmp_comp}"')
 	os.rm(tmp_plain) or {}
 	if zstd_res.exit_code != 0 { os.rm(tmp_comp) or {}; return error('ZSTD compression failed') }
 
-	os.setenv('SALTY_PASS', password, true)
-	res := os.execute('openssl enc -chacha20 -nosalt -pass env:SALTY_PASS -pbkdf2 -in ${tmp_comp} -out ${tmp_enc}')
-	os.setenv('SALTY_PASS', '', true)
+	// 1. Encryption
+	mut p_enc := os.new_process('openssl')
+	p_enc.set_args(['enc', '-chacha20', '-pbkdf2', '-iter', '100000', '-pass', 'stdin', '-in', tmp_comp, '-out', tmp_enc])
+	p_enc.run()
+	p_enc.stdin_write(password + '\n')
+	p_enc.wait()
+	p_enc.close()
 	os.rm(tmp_comp) or {}
+	if p_enc.exit_code != 0 { os.rm(tmp_enc) or {}; return error('OpenSSL encryption failed') }
 
-	if res.exit_code != 0 { os.rm(tmp_enc) or {}; return error('OpenSSL failed') }
+	// 2. Authenticity (HMAC-SHA256) - Encrypt-then-MAC
+	// Write key to secure file using Python to avoid any shell interpolation/exposure
+	mut p_key := os.new_process('python3')
+	p_key.set_args(['-c', 'import sys; open(sys.argv[1], "wb").write(sys.stdin.read().encode())', tmp_key])
+	p_key.run()
+	p_key.stdin_write(password)
+	p_key.wait()
+	p_key.close()
+
+	mut p_mac := os.new_process('python3')
+	p_mac.set_args(['-c', 'import hmac, hashlib, sys; key=open(sys.argv[1], "rb").read(); data=open(sys.argv[2], "rb").read(); print(hmac.new(key, data, hashlib.sha256).digest().hex())', tmp_key, tmp_enc])
+	p_mac.run()
+	p_mac.wait()
+	mac_hex := p_mac.stdout_read().trim_space()
+	p_mac.close()
+
+	if p_mac.exit_code != 0 {
+		os.rm(tmp_key) or {}
+		os.rm(tmp_enc) or {}
+		return error('MAC generation failed')
+	}
+
+	mac_bytes := hex_to_bytes(mac_hex)!
 	enc_bytes := os.read_bytes(tmp_enc)!
+
+	// Secure cleanup
+	os.rm(tmp_key) or {}
 	os.rm(tmp_enc) or {}
-	return enc_bytes.hex()
+
+	// Result is MAC (32 bytes) + Ciphertext
+	mut combined := mac_bytes.clone()
+	combined << enc_bytes
+	return combined.hex()
 }
 
-fn openssl_decrypt(hex_ciphertext string, password string) !string {
-	enc_bytes := hex_to_bytes(hex_ciphertext)!
-	tmp_enc := os.join_path(os.temp_dir(), 'enc_${os.getpid()}.bin')
-	tmp_comp := os.join_path(os.temp_dir(), 'comp_${os.getpid()}.zst')
-	tmp_plain := os.join_path(os.temp_dir(), 'plain_${os.getpid()}.txt')
+fn compare_macs(a []u8, b []u8) bool {
+	if a.len != b.len { return false }
+	mut res := 0
+	for i in 0 .. a.len {
+		res |= a[i] ^ b[i]
+	}
+	return res == 0
+}
 
-	os.write_bytes(tmp_enc, enc_bytes)!
-	os.setenv('SALTY_PASS', password, true)
-	res := os.execute('openssl enc -chacha20 -d -nosalt -pass env:SALTY_PASS -pbkdf2 -in ${tmp_enc} -out ${tmp_comp}')
-	os.setenv('SALTY_PASS', '', true)
+fn openssl_decrypt(hex_payload string, password string) !string {
+	payload_bytes := hex_to_bytes(hex_payload)!
+	if payload_bytes.len < 32 { return error('Payload too short (missing MAC)') }
+
+	received_mac := payload_bytes[0..32]
+	ciphertext := payload_bytes[32..]
+
+	// Generate a high-entropy ID for temporary files to prevent predictability
+	mut entropy_p := os.new_process('openssl')
+	entropy_p.set_args(['rand', '-hex', '16'])
+	entropy_p.run()
+	entropy_p.wait()
+	tmp_entropy := entropy_p.stdout_read().trim_space()
+	entropy_p.close()
+	tmp_id := '${os.getpid()}_${tmp_entropy}'
+
+	tmp_enc := os.path_abs(os.join_path(os.temp_dir(), 'salty_e_${tmp_id}.bin'))
+	tmp_comp := os.path_abs(os.join_path(os.temp_dir(), 'salty_c_${tmp_id}.zst'))
+	tmp_plain := os.path_abs(os.join_path(os.temp_dir(), 'salty_p_${tmp_id}.txt'))
+	tmp_key := os.path_abs(os.join_path(os.temp_dir(), 'salty_k_${tmp_id}.txt'))
+
+	// Atomic creation with 0600 permissions
+	os.execute('python3 -c "import os; [os.open(f, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600) for f in [\'${tmp_enc}\', \'${tmp_comp}\', \'${tmp_plain}\', \'${tmp_key}\']]"')
+
+	os.write_bytes(tmp_enc, ciphertext)!
+
+	// 1. Verify MAC first
+	// Write key to secure file via stdin to avoid process list exposure
+	mut p_key := os.new_process('python3')
+	p_key.set_args(['-c', 'import sys; open(sys.argv[1], "wb").write(sys.stdin.read().encode())', tmp_key])
+	p_key.run()
+	p_key.stdin_write(password)
+	p_key.wait()
+	p_key.close()
+
+	mut p_mac := os.new_process('python3')
+	p_mac.set_args(['-c', 'import hmac, hashlib, sys; key=open(sys.argv[1], "rb").read(); data=open(sys.argv[2], "rb").read(); print(hmac.new(key, data, hashlib.sha256).digest().hex())', tmp_key, tmp_enc])
+	p_mac.run()
+	p_mac.wait()
+	calculated_mac_hex := p_mac.stdout_read().trim_space()
+	p_mac.close()
+	os.rm(tmp_key) or {}
+
+	if p_mac.exit_code != 0 { os.rm(tmp_enc) or {}; return error('MAC verification failed') }
+
+	calculated_mac := hex_to_bytes(calculated_mac_hex)!
+
+	// Constant-time comparison
+	if !compare_macs(calculated_mac, received_mac) {
+		os.rm(tmp_enc) or {}
+		return error('Authenticity check failed: Data may have been tampered with or wrong password.')
+	}
+
+	// 2. Decrypt
+	mut p_dec := os.new_process('openssl')
+	p_dec.set_args(['enc', '-chacha20', '-d', '-pbkdf2', '-iter', '100000', '-pass', 'stdin', '-in', tmp_enc, '-out', tmp_comp])
+	p_dec.run()
+	p_dec.stdin_write(password + '\n')
+	p_dec.wait()
+	p_dec.close()
 	os.rm(tmp_enc) or {}
 
-	if res.exit_code != 0 { os.rm(tmp_comp) or {}; return error('OpenSSL failed') }
-	zstd_res := os.execute('zstd -d -f ${tmp_comp} -o ${tmp_plain}')
+	if p_dec.exit_code != 0 { os.rm(tmp_comp) or {}; return error('OpenSSL decryption failed') }
+
+	zstd_res := os.execute('zstd -d -f "${tmp_comp}" -o "${tmp_plain}"')
 	os.rm(tmp_comp) or {}
 
-	if zstd_res.exit_code != 0 { os.rm(tmp_plain) or {}; return error('ZSTD failed') }
+	if zstd_res.exit_code != 0 { os.rm(tmp_plain) or {}; return error('ZSTD decompression failed') }
 	plaintext := os.read_file(tmp_plain)!
 	os.rm(tmp_plain) or {}
 	return plaintext
@@ -194,17 +305,25 @@ fn get_custom_map_neighbors(ch rune, key_map []rune) []rune {
 
 fn get_stego_choices(ch rune, custom_chars []rune, key_map []rune, use_qwerty bool, fallback_chars []rune) []rune {
 	mut raw := []rune{}
-	if custom_chars.len > 0 { raw = custom_chars.clone() }
-	else if key_map.len > 0 { 
+	if custom_chars.len > 0 {
+		raw = custom_chars.clone()
+	} else if key_map.len > 0 {
 		raw = get_custom_map_neighbors(ch, key_map)
 		if raw.len == 0 { raw = key_map.clone() }
+	} else if use_qwerty {
+		raw = get_english_qwerty_neighbors(ch)
 	}
-	else if use_qwerty { raw = get_english_qwerty_neighbors(ch) }
 	
+	// Ensure we have at least some choices even if neighbors/keymaps fail
 	if raw.len < 2 {
 		for r in fallback_chars { if r != ch { raw << r } }
 	}
 	
+	// Ultimate fallback to ensure no crash
+	if raw.len < 2 {
+		for r in [`e`, `t`, `a`, `o`, `i`, `n`] { if r != ch { raw << r } }
+	}
+
 	mut unique := []rune{}
 	for r in raw { if !(r in unique) { unique << r } }
 	unique.sort()
@@ -213,10 +332,16 @@ fn get_stego_choices(ch rune, custom_chars []rune, key_map []rune, use_qwerty bo
 
 fn encrypt_text_stego(message string, cover_text string, password string, seed u64, intensity int, typo_chars_str string, key_map_str string, use_qwerty bool, overwrite bool) ! {
 	hex_cipher := openssl_encrypt(message, password)!
+
+	// Ensure the payload isn't excessively large to prevent memory exhaustion
+	if hex_cipher.len > 2000000 { // Approx 1MB ciphertext
+		return error("Payload too large for steganography. Maximum size is approx 1MB.")
+	}
+
 	safe_hex := '1' + hex_cipher
 	mut p := big.integer_from_radix(safe_hex, 16)!
 	zero := big.integer_from_int(0)
-	
+
 	mut fallback_chars := []rune{}
 	for r in cover_text.runes() {
 		if !(r in fallback_chars) && r != 32 && r != 10 && r != 13 { fallback_chars << r }
@@ -358,9 +483,10 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 
 fn encrypt_number_flow(message string, password string, seed u64, formats []Format) ! {
 	hex_ciphertext := openssl_encrypt(message, password)!
-	big_int := big.integer_from_radix(hex_ciphertext, 16)!
+	// Use '1' prefix to preserve leading zero bytes during BigInt conversion
+	big_int := big.integer_from_radix('1' + hex_ciphertext, 16)!
 	dec_payload := big_int.str()
-	dec_str := pad_left_zero(dec_payload.len, 4) + dec_payload
+	dec_str := pad_left_zero(dec_payload.len, 5) + dec_payload
 
 	mut chunks := []string{}
 	mut cursor := 0
@@ -418,12 +544,16 @@ fn decrypt_number_flow(carrier_text string, password string, seed u64, formats [
 	}
 
 	dec_str := original_chunks.join('')
-	payload_len := dec_str[0 .. 4].int()
-	dec_payload := dec_str[4 .. 4 + payload_len]
+	payload_len := dec_str[0 .. 5].int()
+	dec_payload := dec_str[5 .. 5 + payload_len]
 
 	big_int := big.integer_from_string(dec_payload)!
-	mut hex_ciphertext := big_int.hex()
-	if hex_ciphertext.len % 2 != 0 { hex_ciphertext = '0' + hex_ciphertext }
+	mut hex_payload := big_int.hex()
+
+	if hex_payload.len == 0 || hex_payload[0] != `1` {
+		return error("Number decryption failed: Data corruption or wrong parameters.")
+	}
+	hex_ciphertext := hex_payload[1..]
 
 	plaintext := openssl_decrypt(hex_ciphertext, password)!
 	println('=== DECRYPTION ===\n' + plaintext)
