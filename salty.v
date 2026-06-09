@@ -544,30 +544,113 @@ fn decrypt_number_flow(carrier_text string, password string, seed u64, formats [
 	println('=== DECRYPTION ===\n' + plaintext)
 }
 
-fn parse_mapping(raw string) map[string]string {
-	mut m := map[string]string{}
+fn parse_mapping(raw string) map[string][]string {
+	mut m := map[string][]string{}
 	if raw == '' { return m }
 	pairs := raw.split(',')
 	for pair in pairs {
-		sub := pair.split(':')
-		if sub.len == 2 {
-			m[sub[0].trim_space()] = sub[1].trim_space()
+		parts := pair.split(':')
+		if parts.len >= 2 {
+			key := parts[0].trim_space()
+			mut values := []string{}
+			for v in parts[1..] {
+				trimmed := v.trim_space()
+				if trimmed != '' {
+					values << trimmed
+				}
+			}
+			m[key] = values
 		}
 	}
 	return m
 }
 
-fn reverse_mapping(m map[string]string) map[string]string {
+fn reverse_mapping(m map[string][]string) map[string]string {
 	mut rev := map[string]string{}
-	for k, v in m {
-		rev[v] = k
+	for k, vals in m {
+		for v in vals {
+			rev[v] = k
+		}
 	}
 	return rev
 }
 
-fn apply_mapping(text string, m map[string]string) string {
-	mut out := text
-	for k, v in m {
+fn sort_strings_by_length_desc(mut arr []string) {
+	for i := 0; i < arr.len; i++ {
+		for j := i + 1; j < arr.len; j++ {
+			if arr[i].len < arr[j].len {
+				arr[i], arr[j] = arr[j], arr[i]
+			}
+		}
+	}
+}
+
+fn get_noise_chars(custom_str string) []rune {
+	if custom_str != '' {
+		mut runes := []rune{}
+		for r in custom_str.replace(',', '').trim_space().runes() {
+			runes << r
+		}
+		if runes.len > 0 {
+			return runes
+		}
+	}
+	return [
+		`*`, `~`, `_`, `•`, `°`, `†`, `‡`, `▲`, `▼`, `◆`, `◇`, `■`, `□`, 
+		`◀`, `▶`, `♠`, `♥`, `♦`, `♣`, `★`, `☆`, `✦`, `✧`, `✪`, `✿`, `❀`
+	]
+}
+
+fn apply_obfuscation(text string, m map[string][]string, noise_intensity int, noise_chars []rune, seed u64) string {
+	mut rng := LCG{state: seed}
+	runes := text.runes()
+	mut result := []rune{}
+
+	for i := 0; i < runes.len; i++ {
+		r := runes[i]
+		r_str := r.str()
+		
+		if r_str in m {
+			options := m[r_str]
+			if options.len > 0 {
+				idx := rng.intn(options.len)
+				opt_runes := options[idx].runes()
+				for opt_r in opt_runes {
+					result << opt_r
+				}
+			} else {
+				result << r
+			}
+		} else {
+			result << r
+		}
+		
+		if noise_intensity > 0 && noise_chars.len > 0 {
+			if rng.intn(100) < noise_intensity {
+				noise_idx := rng.intn(noise_chars.len)
+				result << noise_chars[noise_idx]
+			}
+		}
+	}
+	return result.string()
+}
+
+fn apply_deobfuscation(text string, m map[string][]string, noise_chars []rune) string {
+	mut cleaned_runes := []rune{}
+	for r in text.runes() {
+		if !(r in noise_chars) {
+			cleaned_runes << r
+		}
+	}
+	cleaned_text := cleaned_runes.string()
+	
+	rev := reverse_mapping(m)
+	mut keys := rev.keys()
+	sort_strings_by_length_desc(mut keys)
+
+	mut out := cleaned_text
+	for k in keys {
+		v := rev[k]
 		out = out.replace(k, v)
 	}
 	return out
@@ -591,8 +674,10 @@ fn print_help() {
 	println('  -o, --overwrite            OVERWRITE characters instead of inserting them')
 	println('  -tr, --transpose           Transpose (swap) adjacent characters')
 	println('  -r, --ref "<str>"          Original Reference Text (REQUIRED for Overwrite/Transpose Decrypt)')
-	println('\nMethod 3: Custom Visual Obfuscation (Homoglyphs/Word Substitutions):')
-	println('  -map, --mapping "<str>"    Manual map for replacements (Format: "from:to,from:to")')
+	println('\nMethod 3: Custom Visual Obfuscation (Homoglyphs & Noise Injection):')
+	println('  -map, --mapping "<str>"    Manual map for replacements (Format: "from:to1:to2,from:to")')
+	println('  -ni, --noise-intensity <int> Intensity of noise injection (0-100)')
+	println('  -nc, --noise-chars "<str>" Custom noise symbols (or empty for auto-pool)')
 	println('  -d, --deobfuscate          Reverse the manual map (Deobfuscate)')
 	println('  -h, --help                 Show this help message')
 }
@@ -650,14 +735,27 @@ fn run_interactive() ! {
 	} else if method == '3' {
 		mode_obf := os.input('Choose Action (1: Obfuscate, 2: Deobfuscate): ').trim_space()
 		text_input := os.input('Enter your text: ')
-		mapping_str := os.input('Enter mapping (Format: "from:to,from:to" e.g., "y:ي,VPN:وی‌پی‌ان,بمب:b0mb"): ').trim_space()
+		mapping_str := os.input('Enter mapping (Format: "from:to1:to2,from:to"): ').trim_space()
+		
+		noise_int_str := os.input('Enter Noise Intensity (0-100, or 0 to skip): ').trim_space()
+		noise_int := noise_int_str.int()
+		
+		mut nc_str := ''
+		if noise_int > 0 {
+			nc_str = os.input('Enter Custom Noise Characters (leave empty for default pool): ').trim_space()
+		}
+		
+		seed_str := os.input('Enter Seed (for random choices, e.g. 1): ').trim_space()
+		seed_val := seed_str.u64()
+
 		m := parse_mapping(mapping_str)
+		noise_chars := get_noise_chars(nc_str)
+
 		if mode_obf == '2' {
-			rev_m := reverse_mapping(m)
-			result := apply_mapping(text_input, rev_m)
+			result := apply_deobfuscation(text_input, m, noise_chars)
 			println('\n=== DE-OBFUSCATED TEXT ===\n' + result)
 		} else {
-			result := apply_mapping(text_input, m)
+			result := apply_obfuscation(text_input, m, noise_int, noise_chars, seed_val)
 			println('\n=== OBFUSCATED TEXT ===\n' + result)
 		}
 	}
@@ -696,6 +794,8 @@ fn main() {
 	mut transpose := false
 	mut mapping_str := ''
 	mut deobfuscate := false
+	mut noise_intensity := 0
+	mut noise_chars_str := ''
 
 	for i := 2; i < args.len; i++ {
 		arg := args[i]
@@ -714,6 +814,8 @@ fn main() {
 			'-tr', '--transpose' { transpose = true }
 			'-map', '--mapping' { if i + 1 < args.len { mapping_str = args[i + 1]; i++ } }
 			'-d', '--deobfuscate' { deobfuscate = true }
+			'-ni', '--noise-intensity' { if i + 1 < args.len { noise_intensity = args[i + 1].int(); i++ } }
+			'-nc', '--noise-chars' { if i + 1 < args.len { noise_chars_str = args[i + 1]; i++ } }
 			else {}
 		}
 	}
@@ -728,12 +830,13 @@ fn main() {
 			return
 		}
 		m := parse_mapping(mapping_str)
+		noise_chars := get_noise_chars(noise_chars_str)
+
 		if deobfuscate {
-			rev_m := reverse_mapping(m)
-			result := apply_mapping(text_input, rev_m)
+			result := apply_deobfuscation(text_input, m, noise_chars)
 			println('=== DE-OBFUSCATED TEXT ===\n' + result)
 		} else {
-			result := apply_mapping(text_input, m)
+			result := apply_obfuscation(text_input, m, noise_intensity, noise_chars, seed_val)
 			println('=== OBFUSCATED TEXT ===\n' + result)
 		}
 		return
