@@ -7,11 +7,8 @@ struct LCG {
 }
 
 fn (mut rng LCG) next() u32 {
-	oldstate := rng.state
-	rng.state = oldstate * u64(6364136223846793005) + u64(1442695040888963407)
-	xorshifted := u32(((oldstate >> 18) ^ oldstate) >> 27)
-	rot := u32(oldstate >> 59)
-	return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
+	rng.state = rng.state * u64(6364136223846793005) + u64(1442695040888963407)
+	return u32(rng.state >> 32)
 }
 
 fn (mut rng LCG) intn(n int) int {
@@ -113,42 +110,51 @@ fn openssl_encrypt(plaintext string, password string) !string {
 	tmp_plain := os.join_path(os.temp_dir(), 'plain_${os.getpid()}.txt')
 	tmp_comp := os.join_path(os.temp_dir(), 'comp_${os.getpid()}.zst')
 	tmp_enc := os.join_path(os.temp_dir(), 'enc_${os.getpid()}.bin')
+	
+	defer {
+		os.rm(tmp_plain) or {}
+		os.rm(tmp_comp) or {}
+		os.rm(tmp_enc) or {}
+	}
 
 	os.write_file(tmp_plain, plaintext)!
-	zstd_res := os.execute('zstd -19 -f ${tmp_plain} -o ${tmp_comp}')
-	os.rm(tmp_plain) or {}
-	if zstd_res.exit_code != 0 { os.rm(tmp_comp) or {}; return error('ZSTD compression failed') }
+	zstd_res := os.execute('zstd -19 -q -f ${tmp_plain} -o ${tmp_comp}')
+	if zstd_res.exit_code != 0 { return error('ZSTD compression failed') }
 
 	os.setenv('SALTY_PASS', password, true)
-	res := os.execute('openssl enc -chacha20 -nosalt -pass env:SALTY_PASS -pbkdf2 -in ${tmp_comp} -out ${tmp_enc}')
+	res := os.execute('openssl enc -chacha20 -pass env:SALTY_PASS -pbkdf2 -iter 10000 -in ${tmp_comp} -out ${tmp_enc}')
 	os.setenv('SALTY_PASS', '', true)
-	os.rm(tmp_comp) or {}
 
-	if res.exit_code != 0 { os.rm(tmp_enc) or {}; return error('OpenSSL failed') }
+	if res.exit_code != 0 { return error('OpenSSL failed') }
+	
 	enc_bytes := os.read_bytes(tmp_enc)!
-	os.rm(tmp_enc) or {}
 	return enc_bytes.hex()
 }
 
 fn openssl_decrypt(hex_ciphertext string, password string) !string {
-	enc_bytes := hex_to_bytes(hex_ciphertext)!
 	tmp_enc := os.join_path(os.temp_dir(), 'enc_${os.getpid()}.bin')
 	tmp_comp := os.join_path(os.temp_dir(), 'comp_${os.getpid()}.zst')
 	tmp_plain := os.join_path(os.temp_dir(), 'plain_${os.getpid()}.txt')
+	
+	defer {
+		os.rm(tmp_enc) or {}
+		os.rm(tmp_comp) or {}
+		os.rm(tmp_plain) or {}
+	}
 
+	enc_bytes := hex_to_bytes(hex_ciphertext)!
 	os.write_bytes(tmp_enc, enc_bytes)!
+	
 	os.setenv('SALTY_PASS', password, true)
-	res := os.execute('openssl enc -chacha20 -d -nosalt -pass env:SALTY_PASS -pbkdf2 -in ${tmp_enc} -out ${tmp_comp}')
+	res := os.execute('openssl enc -chacha20 -d -pass env:SALTY_PASS -pbkdf2 -iter 10000 -in ${tmp_enc} -out ${tmp_comp}')
 	os.setenv('SALTY_PASS', '', true)
-	os.rm(tmp_enc) or {}
 
-	if res.exit_code != 0 { os.rm(tmp_comp) or {}; return error('OpenSSL failed') }
-	zstd_res := os.execute('zstd -d -f ${tmp_comp} -o ${tmp_plain}')
-	os.rm(tmp_comp) or {}
-
-	if zstd_res.exit_code != 0 { os.rm(tmp_plain) or {}; return error('ZSTD failed') }
+	if res.exit_code != 0 { return error('OpenSSL failed (Wrong Password or Corrupted Payload)') }
+	
+	zstd_res := os.execute('zstd -d -q -f ${tmp_comp} -o ${tmp_plain}')
+	if zstd_res.exit_code != 0 { return error('ZSTD failed') }
+	
 	plaintext := os.read_file(tmp_plain)!
-	os.rm(tmp_plain) or {}
 	return plaintext
 }
 
