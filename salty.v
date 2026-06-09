@@ -267,7 +267,7 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed u
 					rem = (p % radix_big).str().int()
 					p = p / radix_big
 				} else {
-					rem = 0
+					rem = 0 
 				}
 
 				if rem == 1 {
@@ -289,7 +289,7 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed u
 						rem = (p % radix_big).str().int()
 						p = p / radix_big
 					} else {
-						rem = 0
+						rem = 0 
 					}
 					selected_char := choices[rem]
 					
@@ -544,8 +544,37 @@ fn decrypt_number_flow(carrier_text string, password string, seed u64, formats [
 	println('=== DECRYPTION ===\n' + plaintext)
 }
 
+fn parse_mapping(raw string) map[string]string {
+	mut m := map[string]string{}
+	if raw == '' { return m }
+	pairs := raw.split(',')
+	for pair in pairs {
+		sub := pair.split(':')
+		if sub.len == 2 {
+			m[sub[0].trim_space()] = sub[1].trim_space()
+		}
+	}
+	return m
+}
+
+fn reverse_mapping(m map[string]string) map[string]string {
+	mut rev := map[string]string{}
+	for k, v in m {
+		rev[v] = k
+	}
+	return rev
+}
+
+fn apply_mapping(text string, m map[string]string) string {
+	mut out := text
+	for k, v in m {
+		out = out.replace(k, v)
+	}
+	return out
+}
+
 fn print_help() {
-	println('Usage: salty [encrypt|decrypt] [options]')
+	println('Usage: salty [encrypt|decrypt|obfuscate] [options]')
 	println('Or simply run: salty (for interactive mode)')
 	println('\nGeneral Options:')
 	println('  -m, --message "<str>"      Plaintext message to encrypt')
@@ -562,55 +591,74 @@ fn print_help() {
 	println('  -o, --overwrite            OVERWRITE characters instead of inserting them')
 	println('  -tr, --transpose           Transpose (swap) adjacent characters')
 	println('  -r, --ref "<str>"          Original Reference Text (REQUIRED for Overwrite/Transpose Decrypt)')
+	println('\nMethod 3: Custom Visual Obfuscation (Homoglyphs/Word Substitutions):')
+	println('  -map, --mapping "<str>"    Manual map for replacements (Format: "from:to,from:to")')
+	println('  -d, --deobfuscate          Reverse the manual map (Deobfuscate)')
 	println('  -h, --help                 Show this help message')
 }
 
 fn run_interactive() ! {
 	println('=== SALTY INTERACTIVE MODE ===')
-	method := os.input('Choose Carrier Method (1: Fake Numbers, 2: Text Typos [Steganography]): ').trim_space()
-	mode := os.input('Choose Action (1: Encrypt, 2: Decrypt): ').trim_space()
-	password := os.input_password('Enter OpenSSL Password: ')!
+	method := os.input('Choose Carrier Method (1: Fake Numbers, 2: Text Typos, 3: Custom Manual Obfuscation): ').trim_space()
 	
-	if method == '1' {
-		formats := parse_formats(os.input('Enter Formats (e.g. "+98912:7,603799:10"): ').trim_space())!
-		seed_val := os.input('Enter Seed (number): ').trim_space().u64()
-		if mode == '1' {
-			msg := os.input('Enter Message to encrypt: ')
-			encrypt_number_flow(msg, password, seed_val, formats)!
-		} else {
-			txt := os.input('Enter Carrier Text to decrypt: ')
-			decrypt_number_flow(txt, password, seed_val, formats)!
-		}
-	} else if method == '2' {
-		seed_val := os.input('Enter Typo Seed (number): ').trim_space().u64()
-		intensity := os.input('Enter Typo Intensity (10-90, e.g. 30): ').trim_space().int()
-		qwerty_ans := os.input('Use English QWERTY? (y/n): ').trim_space().to_lower()
-		use_qwerty := qwerty_ans == 'y'
+	if method == '1' || method == '2' {
+		mode := os.input('Choose Action (1: Encrypt, 2: Decrypt): ').trim_space()
+		password := os.input_password('Enter OpenSSL Password: ')!
 		
-		overwrite_ans := os.input('Overwrite characters instead of inserting? (y/n): ').trim_space().to_lower()
-		overwrite := overwrite_ans == 'y'
-
-		transpose_ans := os.input('Enable Transposition (swapping adjacent letters)? (y/n): ').trim_space().to_lower()
-		transpose := transpose_ans == 'y'
-		
-		mut key_map := ''
-		mut typo_chars := ''
-		if !use_qwerty {
-			key_map = os.input('Enter Custom Keyboard Map (e.g. "ضصث..." or empty to skip): ').trim_space()
-			if key_map == '' { typo_chars = os.input('Enter Custom Typo Chars (e.g. "a,b,c" or empty): ').trim_space() }
-		}
-
-		if mode == '1' {
-			msg := os.input('Enter Message to encrypt: ')
-			cover := os.input('Enter Reference Text (The text to hide payload inside): ')
-			encrypt_text_stego(msg, cover, password, seed_val, intensity, typo_chars, key_map, use_qwerty, overwrite, transpose)!
-		} else {
-			carrier := os.input('Enter the Carrier text (containing the hidden typos): ')
-			mut ref_text := ''
-			if overwrite || transpose {
-				ref_text = os.input('Enter ORIGINAL Reference Text: ')
+		if method == '1' {
+			formats := parse_formats(os.input('Enter Formats (e.g. "+98912:7,603799:10"): ').trim_space())!
+			seed_val := os.input('Enter Seed (number): ').trim_space().u64()
+			if mode == '1' {
+				msg := os.input('Enter Message to encrypt: ')
+				encrypt_number_flow(msg, password, seed_val, formats)!
+			} else {
+				txt := os.input('Enter Carrier Text to decrypt: ')
+				decrypt_number_flow(txt, password, seed_val, formats)!
 			}
-			decrypt_text_stego(carrier, ref_text, password, seed_val, intensity, typo_chars, key_map, use_qwerty, overwrite, transpose)!
+		} else {
+			seed_val := os.input('Enter Typo Seed (number): ').trim_space().u64()
+			intensity := os.input('Enter Typo Intensity (10-90, e.g. 30): ').trim_space().int()
+			qwerty_ans := os.input('Use English QWERTY? (y/n): ').trim_space().to_lower()
+			use_qwerty := qwerty_ans == 'y'
+			
+			overwrite_ans := os.input('Overwrite characters instead of inserting? (y/n): ').trim_space().to_lower()
+			overwrite := overwrite_ans == 'y'
+
+			transpose_ans := os.input('Enable Transposition (swapping adjacent letters)? (y/n): ').trim_space().to_lower()
+			transpose := transpose_ans == 'y'
+			
+			mut key_map := ''
+			mut typo_chars := ''
+			if !use_qwerty {
+				key_map = os.input('Enter Custom Keyboard Map (e.g. "ضصث..." or empty to skip): ').trim_space()
+				if key_map == '' { typo_chars = os.input('Enter Custom Typo Chars (e.g. "a,b,c" or empty): ').trim_space() }
+			}
+
+			if mode == '1' {
+				msg := os.input('Enter Message to encrypt: ')
+				cover := os.input('Enter Reference Text (The text to hide payload inside): ')
+				encrypt_text_stego(msg, cover, password, seed_val, intensity, typo_chars, key_map, use_qwerty, overwrite, transpose)!
+			} else {
+				carrier := os.input('Enter the Carrier text: ')
+				mut ref_text := ''
+				if overwrite || transpose {
+					ref_text = os.input('Enter ORIGINAL Reference Text: ')
+				}
+				decrypt_text_stego(carrier, ref_text, password, seed_val, intensity, typo_chars, key_map, use_qwerty, overwrite, transpose)!
+			}
+		}
+	} else if method == '3' {
+		mode_obf := os.input('Choose Action (1: Obfuscate, 2: Deobfuscate): ').trim_space()
+		text_input := os.input('Enter your text: ')
+		mapping_str := os.input('Enter mapping (Format: "from:to,from:to" e.g., "y:ي,VPN:وی‌پی‌ان,بمب:b0mb"): ').trim_space()
+		m := parse_mapping(mapping_str)
+		if mode_obf == '2' {
+			rev_m := reverse_mapping(m)
+			result := apply_mapping(text_input, rev_m)
+			println('\n=== DE-OBFUSCATED TEXT ===\n' + result)
+		} else {
+			result := apply_mapping(text_input, m)
+			println('\n=== OBFUSCATED TEXT ===\n' + result)
 		}
 	}
 }
@@ -628,8 +676,8 @@ fn main() {
 	}
 
 	mode := args[1]
-	if mode != 'encrypt' && mode != 'decrypt' {
-		println('Error: Mode must be "encrypt" or "decrypt"')
+	if mode != 'encrypt' && mode != 'decrypt' && mode != 'obfuscate' {
+		println('Error: Mode must be "encrypt", "decrypt" or "obfuscate"')
 		print_help()
 		return
 	}
@@ -646,6 +694,8 @@ fn main() {
 	mut use_qwerty := false
 	mut overwrite := false
 	mut transpose := false
+	mut mapping_str := ''
+	mut deobfuscate := false
 
 	for i := 2; i < args.len; i++ {
 		arg := args[i]
@@ -662,8 +712,31 @@ fn main() {
 			'-q', '--qwerty' { use_qwerty = true }
 			'-o', '--overwrite' { overwrite = true }
 			'-tr', '--transpose' { transpose = true }
+			'-map', '--mapping' { if i + 1 < args.len { mapping_str = args[i + 1]; i++ } }
+			'-d', '--deobfuscate' { deobfuscate = true }
 			else {}
 		}
+	}
+
+	if mode == 'obfuscate' {
+		if text_input == '' {
+			println('Error: Text is required (-t or --text)')
+			return
+		}
+		if mapping_str == '' {
+			println('Error: Mapping string is required (-map or --mapping)')
+			return
+		}
+		m := parse_mapping(mapping_str)
+		if deobfuscate {
+			rev_m := reverse_mapping(m)
+			result := apply_mapping(text_input, rev_m)
+			println('=== DE-OBFUSCATED TEXT ===\n' + result)
+		} else {
+			result := apply_mapping(text_input, m)
+			println('=== OBFUSCATED TEXT ===\n' + result)
+		}
+		return
 	}
 
 	if password == '' {
