@@ -7,8 +7,11 @@ struct LCG {
 }
 
 fn (mut rng LCG) next() u32 {
-	rng.state = rng.state * u64(6364136223846793005) + u64(1442695040888963407)
-	return u32(rng.state >> 32)
+	oldstate := rng.state
+	rng.state = oldstate * u64(6364136223846793005) + u64(1442695040888963407)
+	xorshifted := u32(((oldstate >> 18) ^ oldstate) >> 27)
+	rot := u32(oldstate >> 59)
+	return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
 }
 
 fn (mut rng LCG) intn(n int) int {
