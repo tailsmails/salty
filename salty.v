@@ -21,9 +21,9 @@ struct Format {
 	payload_len int
 }
 
-struct InjSpot {
-	orig_ch rune
-	inj_ch  rune
+struct DecryptSpot {
+	rem   int
+	radix int
 }
 
 fn pad_left_zero(val int, width int) string {
@@ -80,8 +80,6 @@ fn extract_numbers(text string) ![]string {
 				if current != '+' { numbers << current }
 				current = ''
 			}
-		} else {
-			continue
 		}
 	}
 	if current != '' && current != '+' { numbers << current }
@@ -110,7 +108,7 @@ fn openssl_encrypt(plaintext string, password string) !string {
 	tmp_plain := os.join_path(os.temp_dir(), 'plain_${os.getpid()}.txt')
 	tmp_comp := os.join_path(os.temp_dir(), 'comp_${os.getpid()}.zst')
 	tmp_enc := os.join_path(os.temp_dir(), 'enc_${os.getpid()}.bin')
-	
+
 	defer {
 		os.rm(tmp_plain) or {}
 		os.rm(tmp_comp) or {}
@@ -126,7 +124,6 @@ fn openssl_encrypt(plaintext string, password string) !string {
 	os.setenv('SALTY_PASS', '', true)
 
 	if res.exit_code != 0 { return error('OpenSSL failed') }
-	
 	enc_bytes := os.read_bytes(tmp_enc)!
 	return enc_bytes.hex()
 }
@@ -135,7 +132,7 @@ fn openssl_decrypt(hex_ciphertext string, password string) !string {
 	tmp_enc := os.join_path(os.temp_dir(), 'enc_${os.getpid()}.bin')
 	tmp_comp := os.join_path(os.temp_dir(), 'comp_${os.getpid()}.zst')
 	tmp_plain := os.join_path(os.temp_dir(), 'plain_${os.getpid()}.txt')
-	
+
 	defer {
 		os.rm(tmp_enc) or {}
 		os.rm(tmp_comp) or {}
@@ -144,16 +141,16 @@ fn openssl_decrypt(hex_ciphertext string, password string) !string {
 
 	enc_bytes := hex_to_bytes(hex_ciphertext)!
 	os.write_bytes(tmp_enc, enc_bytes)!
-	
+
 	os.setenv('SALTY_PASS', password, true)
 	res := os.execute('openssl enc -chacha20 -d -pass env:SALTY_PASS -pbkdf2 -iter 10000 -in ${tmp_enc} -out ${tmp_comp}')
 	os.setenv('SALTY_PASS', '', true)
 
-	if res.exit_code != 0 { return error('OpenSSL failed (Wrong Password or Corrupted Payload)') }
-	
+	if res.exit_code != 0 { return error('OpenSSL decryption failed (Wrong password?)') }
+
 	zstd_res := os.execute('zstd -d -q -f ${tmp_comp} -o ${tmp_plain}')
-	if zstd_res.exit_code != 0 { return error('ZSTD failed') }
-	
+	if zstd_res.exit_code != 0 { return error('ZSTD decompression failed') }
+
 	plaintext := os.read_file(tmp_plain)!
 	return plaintext
 }
@@ -220,10 +217,14 @@ fn get_stego_choices(ch rune, custom_chars []rune, key_map []rune, use_qwerty bo
 	return unique
 }
 
-fn encrypt_text_stego(message string, cover_text string, password string, seed u64, intensity int, typo_chars_str string, key_map_str string, use_qwerty bool, overwrite bool) ! {
+fn encrypt_text_stego(message string, cover_text string, password string, seed u64, intensity int, typo_chars_str string, key_map_str string, use_qwerty bool, overwrite bool, transpose bool) ! {
+	mut real_overwrite := overwrite
+	if transpose {
+		real_overwrite = true
+	}
+
 	hex_cipher := openssl_encrypt(message, password)!
-	safe_hex := '1' + hex_cipher
-	mut p := big.integer_from_radix(safe_hex, 16)!
+	mut p := big.integer_from_radix('1' + hex_cipher, 16)!
 	zero := big.integer_from_int(0)
 	
 	mut fallback_chars := []rune{}
@@ -242,89 +243,87 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed u
 	}
 
 	mut rng := LCG{state: seed}
+	runes := cover_text.runes()
 	mut modified_text := []rune{}
 	
-	for ch in cover_text.runes() {
+	mut i := 0
+	for i < runes.len {
+		ch := runes[i]
 		if rng.intn(100) < intensity {
-			choices := get_stego_choices(ch, custom_chars, key_map_runes, use_qwerty, fallback_chars)
-			if choices.len > 1 {
-				mut selected_char := choices[0]
-				if p > zero {
-					radix := choices.len
-					radix_big := big.integer_from_int(radix)
-					rem_big := p % radix_big
-					selected_char = choices[rem_big.str().int()]
-					p = p / radix_big
-				}
-				
-				if overwrite {
-					modified_text << selected_char
+			mut use_swap := false
+			if transpose {
+				has_keyboard := use_qwerty || key_map_runes.len > 0 || custom_chars.len > 0
+				if !has_keyboard {
+					use_swap = true
 				} else {
-					modified_text << ch
-					modified_text << selected_char
+					use_swap = rng.intn(2) == 0
 				}
+			}
+
+			if use_swap && i < runes.len - 1 && runes[i] != runes[i+1] {
+				mut rem := 0
+				if p > zero {
+					radix_big := big.integer_from_int(2)
+					rem = (p % radix_big).str().int()
+					p = p / radix_big
+				} else {
+					rem = 0
+				}
+
+				if rem == 1 {
+					modified_text << runes[i+1]
+					modified_text << runes[i]
+				} else {
+					modified_text << runes[i]
+					modified_text << runes[i+1]
+				}
+				i += 2
 				continue
+			} else {
+				choices := get_stego_choices(ch, custom_chars, key_map_runes, use_qwerty, fallback_chars)
+				if choices.len > 1 {
+					mut rem := 0
+					if p > zero {
+						radix := choices.len
+						radix_big := big.integer_from_int(radix)
+						rem = (p % radix_big).str().int()
+						p = p / radix_big
+					} else {
+						rem = 0
+					}
+					selected_char := choices[rem]
+					
+					if real_overwrite {
+						modified_text << selected_char
+					} else {
+						modified_text << ch
+						modified_text << selected_char
+					}
+					i++
+					continue
+				}
 			}
 		}
 		modified_text << ch
+		i++
 	}
 	
 	if p > zero {
-		return error("Cover text is too short or intensity is too low to hide the encrypted payload. Increase text length or intensity.")
+		return error("Cover text is too short or intensity is too low.")
 	}
 	
 	println('=== STEGANOGRAPHY ENCRYPTION ===')
-	if overwrite { println('Mode: OVERWRITE (Length preserved)') } else { println('Mode: INSERTION') }
+	if transpose { println('Mode: TRANSPOSITION (Active)') }
+	if real_overwrite { println('Mode: OVERWRITE (Length preserved)') } else { println('Mode: INSERTION') }
 	println('Carrier (Copy this completely):')
 	println(modified_text.string())
 }
 
-fn decrypt_text_stego(modified_text string, ref_text string, password string, seed u64, intensity int, typo_chars_str string, key_map_str string, use_qwerty bool, overwrite bool) ! {
+fn decrypt_text_stego(modified_text string, ref_text string, password string, seed u64, intensity int, typo_chars_str string, key_map_str string, use_qwerty bool, overwrite bool, transpose bool) ! {
 	mut rng := LCG{state: seed}
-	mut original_runes := []rune{}
-	mut spots := []InjSpot{}
-	
 	modified_runes := modified_text.runes()
 	
-	if overwrite {
-		if ref_text == '' {
-			return error("Reference text (-r) is REQUIRED for decryption in Overwrite mode!")
-		}
-		ref_runes := ref_text.runes()
-		if ref_runes.len != modified_runes.len {
-			return error("Carrier text length (" + modified_runes.len.str() + ") does not match Reference text length (" + ref_runes.len.str() + ")!")
-		}
-		
-		for i in 0 .. ref_runes.len {
-			orig_ch := ref_runes[i]
-			mod_ch := modified_runes[i]
-			original_runes << orig_ch
-			
-			if rng.intn(100) < intensity {
-				spots << InjSpot{orig_ch: orig_ch, inj_ch: mod_ch}
-			}
-		}
-	} else {
-		mut i := 0
-		for i < modified_runes.len {
-			ch := modified_runes[i]
-			original_runes << ch
-			i++
-			
-			if rng.intn(100) < intensity {
-				if i < modified_runes.len {
-					spots << InjSpot{orig_ch: ch, inj_ch: modified_runes[i]}
-					i++
-				}
-			}
-		}
-	}
-	
-	mut fallback_chars := []rune{}
-	for r in original_runes {
-		if !(r in fallback_chars) && r != 32 && r != 10 && r != 13 { fallback_chars << r }
-	}
-	fallback_chars.sort()
+	mut spots := []DecryptSpot{}
 
 	mut custom_chars := []rune{}
 	if typo_chars_str != '' {
@@ -335,19 +334,129 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 		for r in key_map_str.replace(',', '').trim_space().runes() { key_map_runes << r }
 	}
 
+	mut real_overwrite := overwrite
+	if transpose {
+		real_overwrite = true
+	}
+
+	if real_overwrite {
+		if ref_text == '' {
+			return error("Reference text (-r) is REQUIRED for decryption in Overwrite/Transpose mode!")
+		}
+		ref_runes := ref_text.runes()
+
+		mut fallback_chars := []rune{}
+		for r in ref_runes {
+			if !(r in fallback_chars) && r != 32 && r != 10 && r != 13 { fallback_chars << r }
+		}
+		fallback_chars.sort()
+
+		mut i := 0
+		mut ref_idx := 0
+		for ref_idx < ref_runes.len {
+			if i >= modified_runes.len { break }
+
+			if rng.intn(100) < intensity {
+				mut use_swap := false
+				if transpose {
+					has_keyboard := use_qwerty || key_map_runes.len > 0 || custom_chars.len > 0
+					if !has_keyboard {
+						use_swap = true
+					} else {
+						use_swap = rng.intn(2) == 0
+					}
+				}
+
+				if use_swap && ref_idx < ref_runes.len - 1 && ref_runes[ref_idx] != ref_runes[ref_idx+1] {
+					if i < modified_runes.len - 1 {
+						mut rem := 0
+						if modified_runes[i] == ref_runes[ref_idx+1] && modified_runes[i+1] == ref_runes[ref_idx] {
+							rem = 1
+						} else if modified_runes[i] == ref_runes[ref_idx] && modified_runes[i+1] == ref_runes[ref_idx+1] {
+							rem = 0
+						} else {
+							return error("Data corruption detected at transposition spot!")
+						}
+						spots << DecryptSpot{rem: rem, radix: 2}
+						i += 2
+						ref_idx += 2
+						continue
+					}
+				} else {
+					choices := get_stego_choices(ref_runes[ref_idx], custom_chars, key_map_runes, use_qwerty, fallback_chars)
+					if choices.len > 1 {
+						carrier_char := modified_runes[i]
+						rem := choices.index(carrier_char)
+						if rem == -1 {
+							return error("Data corruption: Extracted typo char not in valid choices.")
+						}
+						spots << DecryptSpot{rem: rem, radix: choices.len}
+						i++
+						ref_idx++
+						continue
+					}
+				}
+			}
+			i++
+			ref_idx++
+		}
+	} else {
+		mut original_runes := []rune{}
+		mut i := 0
+		for i < modified_runes.len {
+			ch := modified_runes[i]
+			original_runes << ch
+			i++
+			if rng.intn(100) < intensity {
+				if i < modified_runes.len {
+					spots << DecryptSpot{rem: -1, radix: -1}
+					i++
+				}
+			}
+		}
+
+		mut fallback_chars_ins := []rune{}
+		for r in original_runes {
+			if !(r in fallback_chars_ins) && r != 32 && r != 10 && r != 13 { fallback_chars_ins << r }
+		}
+		fallback_chars_ins.sort()
+
+		mut rng_ins := LCG{state: seed}
+		mut original_idx := 0
+		mut carrier_idx := 0
+		mut spot_idx := 0
+
+		for original_idx < original_runes.len {
+			ch := original_runes[original_idx]
+			carrier_idx++
+
+			if rng_ins.intn(100) < intensity {
+				if carrier_idx < modified_runes.len {
+					inserted_char := modified_runes[carrier_idx]
+					carrier_idx++
+
+					choices := get_stego_choices(ch, custom_chars, key_map_runes, use_qwerty, fallback_chars_ins)
+					if choices.len > 1 {
+						rem := choices.index(inserted_char)
+						if rem != -1 {
+							spots[spot_idx] = DecryptSpot{rem: rem, radix: choices.len}
+							spot_idx++
+						}
+					}
+				}
+			}
+			original_idx++
+		}
+	}
+
 	mut p := big.integer_from_int(0)
 	mut mult := big.integer_from_int(1)
 	
 	for spot in spots {
-		choices := get_stego_choices(spot.orig_ch, custom_chars, key_map_runes, use_qwerty, fallback_chars)
-		if choices.len > 1 {
-			radix := choices.len
-			rem := choices.index(spot.inj_ch)
-			if rem == -1 { return error("Data corruption: Extracted typo char not in valid choices.") }
-			
-			rem_big := big.integer_from_int(rem)
+		if spot.radix > 1 {
+			rem_big := big.integer_from_int(spot.rem)
 			p = p + (rem_big * mult)
-			mult = mult * big.integer_from_int(radix)
+			mult = mult * big.integer_from_int(spot.radix)
 		}
 	}
 	
@@ -359,10 +468,7 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 	hex_cipher := hex_payload[1..]
 	plaintext := openssl_decrypt(hex_cipher, password)!
 	
-	println('=== DECRYPTION ===')
-	println('Hidden Payload Extracted successfully.')
-	println('\nDecrypted Message:')
-	println(plaintext)
+	println('=== DECRYPTION ===\n${plaintext}')
 }
 
 fn encrypt_number_flow(message string, password string, seed u64, formats []Format) ! {
@@ -401,7 +507,7 @@ fn encrypt_number_flow(message string, password string, seed u64, formats []Form
 	for i in 0 .. chunks.len { proposed[i] = chunks[shuffled_indices[i]] }
 
 	println('=== NUMBER ENCRYPTION ===')
-	println('Proposed obfuscated numbers (Place these into your text in this EXACT order):')
+	println('Proposed obfuscated numbers:')
 	for idx, num in proposed { println('  ' + (idx + 1).str() + ': ' + num) }
 }
 
@@ -453,8 +559,9 @@ fn print_help() {
 	println('  -tc, --typo-chars "<str>"  Custom typo letters (e.g. "a,z,c")')
 	println('  -km, --key-map "<str>"     Custom keyboard map (e.g. "ضصث...")')
 	println('  -q, --qwerty               Enable English QWERTY mode')
-	println('  -o, --overwrite            OVERWRITE characters instead of inserting them (Keeps text length same)')
-	println('  -r, --ref "<str>"          Original Reference Text (REQUIRED for Decrypting Overwrite mode)')
+	println('  -o, --overwrite            OVERWRITE characters instead of inserting them')
+	println('  -tr, --transpose           Transpose (swap) adjacent characters')
+	println('  -r, --ref "<str>"          Original Reference Text (REQUIRED for Overwrite/Transpose Decrypt)')
 	println('  -h, --help                 Show this help message')
 }
 
@@ -482,25 +589,28 @@ fn run_interactive() ! {
 		
 		overwrite_ans := os.input('Overwrite characters instead of inserting? (y/n): ').trim_space().to_lower()
 		overwrite := overwrite_ans == 'y'
+
+		transpose_ans := os.input('Enable Transposition (swapping adjacent letters)? (y/n): ').trim_space().to_lower()
+		transpose := transpose_ans == 'y'
 		
 		mut key_map := ''
 		mut typo_chars := ''
 		if !use_qwerty {
 			key_map = os.input('Enter Custom Keyboard Map (e.g. "ضصث..." or empty to skip): ').trim_space()
-			if key_map == '' { typo_chars = os.input('Enter Custom Typo Chars (e.g. "a,b,c" or empty for Auto-Text mode): ').trim_space() }
+			if key_map == '' { typo_chars = os.input('Enter Custom Typo Chars (e.g. "a,b,c" or empty): ').trim_space() }
 		}
 
 		if mode == '1' {
 			msg := os.input('Enter Message to encrypt: ')
 			cover := os.input('Enter Reference Text (The text to hide payload inside): ')
-			encrypt_text_stego(msg, cover, password, seed_val, intensity, typo_chars, key_map, use_qwerty, overwrite)!
+			encrypt_text_stego(msg, cover, password, seed_val, intensity, typo_chars, key_map, use_qwerty, overwrite, transpose)!
 		} else {
 			carrier := os.input('Enter the Carrier text (containing the hidden typos): ')
 			mut ref_text := ''
-			if overwrite {
-				ref_text = os.input('Enter ORIGINAL Reference Text (Required for Overwrite mode): ')
+			if overwrite || transpose {
+				ref_text = os.input('Enter ORIGINAL Reference Text: ')
 			}
-			decrypt_text_stego(carrier, ref_text, password, seed_val, intensity, typo_chars, key_map, use_qwerty, overwrite)!
+			decrypt_text_stego(carrier, ref_text, password, seed_val, intensity, typo_chars, key_map, use_qwerty, overwrite, transpose)!
 		}
 	}
 }
@@ -535,6 +645,7 @@ fn main() {
 	mut key_map := ''
 	mut use_qwerty := false
 	mut overwrite := false
+	mut transpose := false
 
 	for i := 2; i < args.len; i++ {
 		arg := args[i]
@@ -550,7 +661,8 @@ fn main() {
 			'-km', '--key-map' { if i + 1 < args.len { key_map = args[i + 1]; i++ } }
 			'-q', '--qwerty' { use_qwerty = true }
 			'-o', '--overwrite' { overwrite = true }
-			else { println('Warning: Unknown flag $arg') }
+			'-tr', '--transpose' { transpose = true }
+			else {}
 		}
 	}
 
@@ -575,10 +687,10 @@ fn main() {
 		if mode == 'encrypt' {
 			if message == '' { println('Error: Message required (-m)'); return }
 			if text_input == '' { println('Error: Cover text required (-t)'); return }
-			encrypt_text_stego(message, text_input, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite) or { println('Encryption failed: ${err}') }
+			encrypt_text_stego(message, text_input, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite, transpose) or { println('Encryption failed: ${err}') }
 		} else {
 			if text_input == '' { println('Error: Carrier text required (-t)'); return }
-			decrypt_text_stego(text_input, ref_text, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite) or { println('Decryption failed: ${err}') }
+			decrypt_text_stego(text_input, ref_text, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite, transpose) or { println('Decryption failed: ${err}') }
 		}
 	} else {
 		println('Error: You must provide either --formats (for Number Mode) or --typo-intensity (for Text Mode).')
