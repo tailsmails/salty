@@ -638,14 +638,7 @@ fn parse_mapping(raw string) map[string][]string {
 		parts := pair.split(':')
 		if parts.len >= 2 {
 			key := parts[0].trim_space()
-			mut values := []string{}
-			for v in pairs[1..] {
-				trimmed := v.trim_space()
-				if trimmed != '' {
-					values << trimmed
-				}
-			}
-			m[key] = values
+			m[key] = parts[1..].map(it.trim_space())
 		}
 	}
 	return m
@@ -998,15 +991,15 @@ fn deserialize_proof(b []u8, mut offset ProofIndex) ![]big.Integer {
 	return proof
 }
 
-fn derive_seed1_from_password(password string, file_salt []u8, pbkdf2_iter_val int) ![]u8 {
+fn derive_seed1(seed_str string, file_salt []u8, pbkdf2_iter_val int) ![]u8 {
 	mut pbkdf2_iter := pbkdf2_iter_val
 	if pbkdf2_iter <= 0 { pbkdf2_iter = 200000 }
-	derived := pbkdf2.key(password.bytes(), file_salt, pbkdf2_iter, 64, sha512.new())!
+	derived := pbkdf2.key(seed_str.bytes(), file_salt, pbkdf2_iter, 64, sha512.new())!
 	return derived.clone()
 }
 
-fn derive_seed2_from_w(password string, w_str string) ![]u8 {
-	derived := pbkdf2.key(password.bytes(), w_str.bytes(), 1000, 64, sha512.new())!
+fn derive_seed2(seed_str string, w_str string) ![]u8 {
+	derived := pbkdf2.key(seed_str.bytes(), w_str.bytes(), 1000, 64, sha512.new())!
 	return derived.clone()
 }
 
@@ -1140,7 +1133,7 @@ fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) 
 	return os.read_bytes(tmp_out)!
 }
 
-fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool) ! {
+fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1_str string, seed2_str string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 	
 	if prime_bits < 256 || prime_bits > 4096 {
@@ -1197,11 +1190,11 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	key_hex := final_key_bytes[0..32].hex()
 	iv_hex := final_key_bytes[32..48].hex()
 
-	println('[*] Deriving independent Seed 1 from Master Password and File Salt...')
-	seed_bytes1 := derive_seed1_from_password(password, file_salt, pbkdf2_iter)!
+	println('[*] Deriving independent Seed 1 (Puzzle Locator)...')
+	seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
 
-	println('[*] Deriving independent Seed 2 bound to VDF Solution...')
-	seed_bytes2 := derive_seed2_from_w(password, w_trapdoor.str())!
+	println('[*] Deriving independent Seed 2 (Payload Locator) bound to VDF Solution...')
+	seed_bytes2 := derive_seed2(seed2_str, w_trapdoor.str())!
 	
 	header_key_iv := pbkdf2.key(password.bytes(), w_trapdoor.str().bytes(), 1000, 48, sha512.new())!
 	header_key := header_key_iv[0..32].hex()
@@ -1291,7 +1284,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	}
 }
 
-fn locktime_decrypt_flow(file_path string, out_path string, password string, pbkdf2_iter int, shred_orig bool) ! {
+fn locktime_decrypt_flow(file_path string, out_path string, password string, seed1_str string, seed2_str string, pbkdf2_iter int, shred_orig bool) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 	
 	if os.exists(out_path) {
@@ -1309,7 +1302,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, pbk
 	mixed := file_bytes[32..].clone()
 	total_len := mixed.len
 
-	seed_bytes1 := derive_seed1_from_password(password, file_salt, pbkdf2_iter)!
+	seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
 
 	mut all_indices := []int{len: total_len}
 	for i in 0 .. total_len { all_indices[i] = i }
@@ -1442,7 +1435,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, pbk
 	_ = pietrzak_verify(a, x, t_val, header.proof, n) or { false }
 	println('[+] Mathematical verification of the puzzle proof: COMPLETE')
 
-	seed_bytes2 := derive_seed2_from_w(password, x.str()) or { []u8{len: 64} }
+	seed_bytes2 := derive_seed2(seed2_str, x.str()) or { []u8{len: 64} }
 	
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
 	for i := remaining_indices.len - 1; i > 0; i-- {
@@ -1515,31 +1508,33 @@ fn print_help() {
 	println('  -f, --file <path>          Input file to encrypt/decrypt')
 	println('  -o, --out <path>           Output file path')
 	println('  -t, --time <seconds>       Time-lock duration in seconds (Default: 10)')
-	println('  -p, --pass <password>      Master password (All subkeys are securely derived from this)')
+	println('  -p, --pass <password>      Master password for ChaCha20/Header encryption')
+	println('  -s1, --seed1 <str>         Independent password/seed to map the puzzle blocks')
+	println('  -s2, --seed2 <str>         Independent password/seed to map the payload blocks')
 	println('  -sh, --shred               Securely shred the original input file after successful execution')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
 	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
 	println('  --threads <count>          Argon2 Threads (Default: 4)')
 	println('  --prime <bits>             Size of dynamic primes in bits (Default: 512)')
-	println('  --pbkdf2-iter <count>      PBKDF2 iterations for key stretching (Default: 200000)')
+	println('  --pbkdf2-iter <count>      PBKDF2 iterations for structural key stretching (Default: 200000)')
 	println('\nSalty Steganography Options:')
 	println('  -m, --message <str>        Plaintext message to hide')
 	println('  -t, --text <str>           Cover text (for encrypt) or carrier text (for decrypt)')
-	println('  -p, --pass <password>      Encryption password')
-	println('  -s, --seed <number>        Deterministic u64 seed')
-	println('  -f, --formats <str>        Formats list (e.g., "+98912:7,6037:10")')
-	println('  -ti, --typo-intensity <n>  Intensity of typos (e.g., 30)')
+	println('  -r, --ref <str>            Original Reference text (Required for Overwrite/Transpose Dec)')
+	println('  -p, --pass <password>      Cryptographic password')
+	println('  -s, --seed <number>        Deterministic RNG seed for positions and choices')
+	println('  -f, --formats <str>        Layouts for Number Mode (e.g., "+98912:7,6037:10")')
+	println('  -ti, --typo-intensity <n>  Typo/Swap frequency percentage (1-100)')
 	println('  -tc, --typo-chars <str>    Custom typo letters')
 	println('  -km, --key-map <str>       Custom keyboard map')
-	println('  -q, --qwerty               Use QWERTY map')
-	println('  -o, --overwrite            Overwrite chars instead of inserting')
-	println('  -tr, --transpose           Transpose adjacent chars')
-	println('  -r, --ref <str>            Reference text (Required for Overwrite/Transpose decrypt)')
+	println('  -q, --qwerty               Standard US-QWERTY proximity logic')
+	println('  -o, --overwrite            Overwrites characters instead of inserting')
+	println('  -tr, --transpose           Swaps adjacent letters instead of replacing them')
 	println('\nSalty Visual Obfuscation Options:')
-	println('  -map, --mapping <str>      Manual replacement map')
-	println('  -ni, --noise-intensity <n> Noise intensity (0-100)')
-	println('  -nc, --noise-chars <str>   Custom noise pool')
-	println('  -d, --deobfuscate          Deobfuscate text')
+	println('  -map, --mapping <str>      Custom 1-to-many char mapping ("from:to1:to2")')
+	println('  -ni, --noise-intensity <n> Frequency of noise character injection (0-100)')
+	println('  -nc, --noise-chars <str>   Custom noise symbols')
+	println('  -d, --deobfuscate          Reverse the visual mapping and strip noise')
 }
 
 fn run_salty_interactive() ! {
@@ -1647,7 +1642,7 @@ fn main() {
 
 	mut is_locktime := false
 	for a in args {
-		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred'] {
+		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s1', '--seed1', '-s2', '--seed2'] {
 			is_locktime = true
 			break
 		}
@@ -1672,6 +1667,8 @@ fn main() {
 	mut text_input := ''
 	mut ref_text := ''
 	mut password := ''
+	mut seed1_str := ''
+	mut seed2_str := ''
 	mut seed_val := u64(0)
 	mut raw_formats := ''
 	mut typo_intensity := 0
@@ -1691,7 +1688,9 @@ fn main() {
 				'-f' { if i + 1 < args.len { file_path = args[i+1]; i++ } }
 				'-o' { if i + 1 < args.len { out_path = args[i+1]; i++ } }
 				'-t' { if i + 1 < args.len { duration = args[i+1].u64(); i++ } }
-				'-p' { if i + 1 < args.len { password = args[i+1]; i++ } }
+				'-p', '--pass' { if i + 1 < args.len { password = args[i+1]; i++ } }
+				'-s1', '--seed1' { if i + 1 < args.len { seed1_str = args[i+1]; i++ } }
+				'-s2', '--seed2' { if i + 1 < args.len { seed2_str = args[i+1]; i++ } }
 				'--mem' { if i + 1 < args.len { mem = args[i+1].u32(); i++ } }
 				'--iter' { if i + 1 < args.len { iter = args[i+1].u32(); i++ } }
 				'--threads' { if i + 1 < args.len { threads = u8(args[i+1].int()); i++ } }
@@ -1705,13 +1704,19 @@ fn main() {
 		if password == '' {
 			password = os.input_password('Enter Master Password: ') or { panic(err) }
 		}
+		if seed1_str == '' {
+			seed1_str = os.input_password('Enter Seed 1 (Puzzle Locator Key): ') or { panic(err) }
+		}
+		if seed2_str == '' {
+			seed2_str = os.input_password('Enter Seed 2 (Payload Locator Key): ') or { panic(err) }
+		}
 
 		if mode == 'encrypt' {
-			locktime_encrypt_flow(file_path, out_path, duration, password, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig) or {
+			locktime_encrypt_flow(file_path, out_path, duration, password, seed1_str, seed2_str, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig) or {
 				println('[-] Encryption Error: ${err}')
 			}
 		} else if mode == 'decrypt' {
-			locktime_decrypt_flow(file_path, out_path, password, pbkdf2_iter, shred_orig) or {
+			locktime_decrypt_flow(file_path, out_path, password, seed1_str, seed2_str, pbkdf2_iter, shred_orig) or {
 				println('[-] Decryption Error: ${err}')
 			}
 		}
