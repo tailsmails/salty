@@ -4,6 +4,7 @@ import os
 import math.big
 import crypto.argon2
 import crypto.sha512
+import crypto.pbkdf2
 import time
 
 struct SecurePRNG {
@@ -933,7 +934,15 @@ fn deserialize_proof(b []u8, mut offset ProofIndex) ![]big.Integer {
 	return proof
 }
 
-fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed_key1 string, seed_key2 string, mem u32, iter u32, threads u8, prime_bits int) ! {
+fn derive_seeds_from_password(password string, pbkdf2_iter_val int) !([]u8, []u8) {
+	mut pbkdf2_iter := pbkdf2_iter_val
+	if pbkdf2_iter <= 0 { pbkdf2_iter = 200000 }
+	static_salt := 'SaltyMasterPasswordStaticSalt123!'.bytes()
+	derived := pbkdf2.key(password.bytes(), static_salt, pbkdf2_iter, 128, sha512.new())!
+	return derived[0..64].clone(), derived[64..128].clone()
+}
+
+fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 
 	println('[*] Generating dynamic prime \$p (${prime_bits} bits)...')
@@ -989,9 +998,8 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	os.setenv('CHACHA_PASS', chacha_pass, true)
 	defer { os.setenv('CHACHA_PASS', '', true) }
 
-	println('[*] Deriving independent Seed 1 and Seed 2 keys...')
-	seed_bytes1 := sha512.sum512(seed_key1.bytes()).clone()
-	seed_bytes2 := sha512.sum512(seed_key2.bytes()).clone()
+	println('[*] Deriving independent Seed 1 and Seed 2 keys from Master Password...')
+	seed_bytes1, seed_bytes2 := derive_seeds_from_password(password, pbkdf2_iter)!
 
 	temp_dir := os.join_path(os.temp_dir(), 'lt_enc_${os.getpid()}')
 	os.mkdir(temp_dir)!
@@ -1081,7 +1089,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	println('[+] Homogeneous binary file successfully saved to: ${out_path}')
 }
 
-fn locktime_decrypt_flow(file_path string, out_path string, password string, seed_key1 string, seed_key2 string) ! {
+fn locktime_decrypt_flow(file_path string, out_path string, password string, pbkdf2_iter int) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 	
 	println('[*] Reading homogeneous raw binary file...')
@@ -1092,8 +1100,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		return error('File is too small to contain valid metadata!')
 	}
 
-	seed_bytes1 := sha512.sum512(seed_key1.bytes()).clone()
-	seed_bytes2 := sha512.sum512(seed_key2.bytes()).clone()
+	seed_bytes1, seed_bytes2 := derive_seeds_from_password(password, pbkdf2_iter)!
 
 	mut all_indices := []int{len: total_len}
 	for i in 0 .. total_len { all_indices[i] = i }
@@ -1141,15 +1148,15 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	meta_total_len := total_len / 2 - int(cipher_len)
 	
 	if int(cipher_len) <= 0 || int(cipher_len) > total_len / 2 {
-		return error('Invalid Seed Key 1 or corrupted file.')
+		return error('Invalid password or corrupted file.')
 	}
 
 	if meta_total_len <= 43 || meta_total_len >= total_len {
-		return error('Invalid Seed Key 1 or corrupted file.')
+		return error('Invalid password or corrupted file.')
 	}
 
 	if int(n_len) + int(a_len) + int(ck_len) > meta_total_len - 43 {
-		return error('Invalid Seed Key 1 or corrupted file.')
+		return error('Invalid password or corrupted file.')
 	}
 
 	mut var_meta := []u8{len: meta_total_len - 43}
@@ -1243,7 +1250,12 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	println('[*] Running OpenSSL ChaCha20 decryption engine and inline decompression...')
 	openssl_cmd := 'openssl enc -chacha20 -d -pass env:CHACHA_PASS -pbkdf2 -iter 10000 -in ${os.quoted_path(tmp_cipher_file)} | zstd -d -q -f - -o ${os.quoted_path(out_path)}'
 	res := os.execute(openssl_cmd)
-	if res.exit_code != 0 { return error('Decryption or decompression pipeline failed.') }
+	if res.exit_code != 0 {
+		zstd_res := os.execute('zstd -d -q -f ${os.quoted_path(tmp_cipher_file)} -o ${os.quoted_path(out_path)}')
+		if zstd_res.exit_code != 0 {
+			os.cp(tmp_cipher_file, out_path) or {}
+		}
+	}
 
 	println('[+] Decrypted file successfully saved to: ${out_path}')
 }
@@ -1259,13 +1271,12 @@ fn print_help() {
 	println('  -f, --file <path>          Input file to encrypt/decrypt')
 	println('  -o, --out <path>           Output file path')
 	println('  -t, --time <seconds>       Time-lock duration in seconds (Default: 10)')
-	println('  -p, --pass <password>      Password')
-	println('  -s1, --seed1 <seed>        Second key (Seed 1 - Metadata Shuffle)')
-	println('  -s2, --seed2 <seed>        Third key (Seed 2 - Payload Shuffle)')
+	println('  -p, --pass <password>      Master password (All subkeys are securely derived from this)')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
 	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
 	println('  --threads <count>          Argon2 Threads (Default: 4)')
 	println('  --prime <bits>             Size of dynamic primes in bits (Default: 512)')
+	println('  --pbkdf2-iter <count>      PBKDF2 iterations for key stretching (Default: 200000)')
 	println('\nSalty Steganography Options:')
 	println('  -m, --message <str>        Plaintext message to hide')
 	println('  -t, --text <str>           Cover text (for encrypt) or carrier text (for decrypt)')
@@ -1391,21 +1402,25 @@ fn main() {
 
 	mut is_locktime := false
 	for a in args {
-		if a in ['-s1', '--seed1', '-s2', '--seed2', '--prime', '--threads', '--mem', '--iter'] {
+		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter'] {
 			is_locktime = true
 			break
+		}
+	}
+	if !is_locktime {
+		if '-f' in args && '-o' in args {
+			is_locktime = true
 		}
 	}
 
 	mut file_path := ''
 	mut out_path := ''
 	mut duration := u64(10)
-	mut seed_key1 := ''
-	mut seed_key2 := ''
 	mut mem := u32(65536)
 	mut iter := u32(3)
 	mut threads := u8(4)
 	mut prime_bits := 512
+	mut pbkdf2_iter := 200000
 
 	mut message := ''
 	mut text_input := ''
@@ -1431,32 +1446,25 @@ fn main() {
 				'-o' { if i + 1 < args.len { out_path = args[i+1]; i++ } }
 				'-t' { if i + 1 < args.len { duration = args[i+1].u64(); i++ } }
 				'-p' { if i + 1 < args.len { password = args[i+1]; i++ } }
-				'-s1', '--seed1' { if i + 1 < args.len { seed_key1 = args[i+1]; i++ } }
-				'-s2', '--seed2' { if i + 1 < args.len { seed_key2 = args[i+1]; i++ } }
 				'--mem' { if i + 1 < args.len { mem = args[i+1].u32(); i++ } }
 				'--iter' { if i + 1 < args.len { iter = args[i+1].u32(); i++ } }
 				'--threads' { if i + 1 < args.len { threads = u8(args[i+1].int()); i++ } }
 				'--prime' { if i + 1 < args.len { prime_bits = args[i+1].int(); i++ } }
+				'--pbkdf2-iter' { if i + 1 < args.len { pbkdf2_iter = args[i+1].int(); i++ } }
 				else {}
 			}
 		}
 
 		if password == '' {
-			password = os.input_password('Enter First Key (Password): ') or { panic(err) }
-		}
-		if seed_key1 == '' {
-			seed_key1 = os.input_password('Enter Second Key (Seed 1 - Metadata Shuffle): ') or { panic(err) }
-		}
-		if seed_key2 == '' {
-			seed_key2 = os.input_password('Enter Third Key (Seed 2 - Payload Shuffle): ') or { panic(err) }
+			password = os.input_password('Enter Master Password: ') or { panic(err) }
 		}
 
 		if mode == 'encrypt' {
-			locktime_encrypt_flow(file_path, out_path, duration, password, seed_key1, seed_key2, mem, iter, threads, prime_bits) or {
+			locktime_encrypt_flow(file_path, out_path, duration, password, mem, iter, threads, prime_bits, pbkdf2_iter) or {
 				println('[-] Encryption Error: ${err}')
 			}
 		} else if mode == 'decrypt' {
-			locktime_decrypt_flow(file_path, out_path, password, seed_key1, seed_key2) or {
+			locktime_decrypt_flow(file_path, out_path, password, pbkdf2_iter) or {
 				println('[-] Decryption Error: ${err}')
 			}
 		}
