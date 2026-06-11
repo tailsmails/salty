@@ -191,12 +191,16 @@ fn openssl_encrypt(plaintext string, password string) !string {
 	temp_dir := os.join_path(os.temp_dir(), 'st_enc_${os.getpid()}')
 	os.mkdir(temp_dir)!
 	os.chmod(temp_dir, 0o700) or {}
-	defer { os.rmdir_all(temp_dir) or {} }
-
+	
 	tmp_plain := os.join_path(temp_dir, 'plain.txt')
 	tmp_enc := os.join_path(temp_dir, 'enc.bin')
 
 	os.write_file(tmp_plain, plaintext)!
+	
+	defer {
+		secure_shred_file(tmp_plain)
+		os.rmdir_all(temp_dir) or {}
+	}
 
 	os.setenv('SALTY_PASS', password, true)
 	defer { os.setenv('SALTY_PASS', '', true) }
@@ -213,10 +217,14 @@ fn openssl_decrypt(hex_ciphertext string, password string) !string {
 	temp_dir := os.join_path(os.temp_dir(), 'st_dec_${os.getpid()}')
 	os.mkdir(temp_dir)!
 	os.chmod(temp_dir, 0o700) or {}
-	defer { os.rmdir_all(temp_dir) or {} }
-
+	
 	tmp_enc := os.join_path(temp_dir, 'enc.bin')
 	tmp_plain := os.join_path(temp_dir, 'plain.txt')
+
+	defer {
+		secure_shred_file(tmp_plain)
+		os.rmdir_all(temp_dir) or {}
+	}
 
 	enc_bytes := hex_to_bytes(hex_ciphertext)!
 	os.write_bytes(tmp_enc, enc_bytes)!
@@ -777,6 +785,33 @@ fn zeroize(mut b []u8) {
 	}
 }
 
+fn secure_shred_file(path string) {
+	if !os.exists(path) { return }
+	
+	mut res := os.execute('shred -u -n 3 -z ${os.quoted_path(path)}')
+	if res.exit_code == 0 { return }
+	
+	res = os.execute('rm -P -f ${os.quoted_path(path)}')
+	if res.exit_code == 0 { return }
+	
+	size := os.file_size(path)
+	if size > 0 {
+		mut f := os.create(path) or {
+			os.rm(path) or {}
+			return
+		}
+		mut zeros := []u8{len: 4096}
+		mut written := u64(0)
+		for written < size {
+			to_write := if size - written > u64(4096) { 4096 } else { int(size - written) }
+			f.write(zeros[0..to_write]) or { break }
+			written += u64(to_write)
+		}
+		f.close()
+	}
+	os.rm(path) or {}
+}
+
 fn is_obviously_composite(n big.Integer) bool {
 	small_primes := [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113]
 	zero := big.integer_from_int(0)
@@ -1078,6 +1113,7 @@ fn openssl_encrypt_header(header_bytes []u8, key_hex string, iv_hex string) ![]u
 	tmp_out := os.join_path(temp_dir, 'out.bin')
 
 	os.write_bytes(tmp_in, header_bytes)!
+	defer { secure_shred_file(tmp_in) }
 
 	cmd := 'openssl enc -chacha20 -e -K ${key_hex} -iv ${iv_hex} -in ${os.quoted_path(tmp_in)} -out ${os.quoted_path(tmp_out)}'
 	res := os.execute(cmd)
@@ -1095,6 +1131,7 @@ fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) 
 	tmp_out := os.join_path(temp_dir, 'out.bin')
 
 	os.write_bytes(tmp_in, enc_header_bytes)!
+	defer { secure_shred_file(tmp_in) }
 
 	cmd := 'openssl enc -chacha20 -d -K ${key_hex} -iv ${iv_hex} -in ${os.quoted_path(tmp_in)} -out ${os.quoted_path(tmp_out)}'
 	res := os.execute(cmd)
@@ -1103,7 +1140,7 @@ fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) 
 	return os.read_bytes(tmp_out)!
 }
 
-fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int) ! {
+fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 	
 	if prime_bits < 256 || prime_bits > 4096 {
@@ -1247,9 +1284,14 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 
 	os.write_bytes(out_path, final_output)!
 	println('[+] Homogeneous binary file successfully saved to: ${out_path}')
+	
+	if shred_orig {
+		println('[*] Securely shredding original input file: ${file_path} ...')
+		secure_shred_file(file_path)
+	}
 }
 
-fn locktime_decrypt_flow(file_path string, out_path string, password string, pbkdf2_iter int) ! {
+fn locktime_decrypt_flow(file_path string, out_path string, password string, pbkdf2_iter int, shred_orig bool) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 	
 	if os.exists(out_path) {
@@ -1441,31 +1483,25 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, pbk
 	defer { os.rmdir_all(temp_dir) or {} }
 
 	tmp_cipher_file := os.join_path(temp_dir, 'lt_dec_tmp.bin')
-	tmp_plain_file := os.join_path(temp_dir, 'lt_dec_plain.bin')
-
 	os.write_bytes(tmp_cipher_file, cipher_bytes)!
 
-	println('[*] Running OpenSSL ChaCha20 decryption engine...')
-	openssl_cmd := 'openssl enc -chacha20 -d -K ${key_hex} -iv ${iv_hex} -in ${os.quoted_path(tmp_cipher_file)} -out ${os.quoted_path(tmp_plain_file)}'
-	_ = os.execute(openssl_cmd)
+	println('[*] Running OpenSSL ChaCha20 decryption engine and decompressing...')
+	pipeline_cmd := 'openssl enc -chacha20 -d -K ${key_hex} -iv ${iv_hex} -in ${os.quoted_path(tmp_cipher_file)} | zstd -d -q -f - -o ${os.quoted_path(out_path)}'
+	res := os.execute(pipeline_cmd)
 
-	zstd_cmd := 'zstd -d -q -f ${os.quoted_path(tmp_plain_file)} -o ${os.quoted_path(out_path)}'
-	zstd_res := os.execute(zstd_cmd)
-
-	if zstd_res.exit_code != 0 {
-		if os.exists(tmp_plain_file) {
-			os.cp(tmp_plain_file, out_path) or {}
-		} else {
-			mut dummy_bytes := []u8{len: safe_cipher_len}
-			mut dummy_rng := SecurePRNG{seed: seed_bytes2}
-			for i in 0 .. dummy_bytes.len {
-				dummy_bytes[i] = dummy_rng.next_u8()
-			}
-			os.write_bytes(out_path, dummy_bytes) or {}
+	if res.exit_code != 0 {
+		if os.exists(out_path) {
+			os.rm(out_path) or {}
 		}
+		return error('Decryption or decompression failed. Data corruption or invalid parameters.')
 	}
 
 	println('[+] Decrypted file successfully saved to: ${out_path}')
+	
+	if shred_orig {
+		println('[*] Securely shredding encrypted carrier file: ${file_path} ...')
+		secure_shred_file(file_path)
+	}
 }
 
 fn print_help() {
@@ -1480,6 +1516,7 @@ fn print_help() {
 	println('  -o, --out <path>           Output file path')
 	println('  -t, --time <seconds>       Time-lock duration in seconds (Default: 10)')
 	println('  -p, --pass <password>      Master password (All subkeys are securely derived from this)')
+	println('  -sh, --shred               Securely shred the original input file after successful execution')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
 	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
 	println('  --threads <count>          Argon2 Threads (Default: 4)')
@@ -1610,7 +1647,7 @@ fn main() {
 
 	mut is_locktime := false
 	for a in args {
-		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter'] {
+		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred'] {
 			is_locktime = true
 			break
 		}
@@ -1629,6 +1666,7 @@ fn main() {
 	mut threads := u8(4)
 	mut prime_bits := 512
 	mut pbkdf2_iter := 200000
+	mut shred_orig := false
 
 	mut message := ''
 	mut text_input := ''
@@ -1659,6 +1697,7 @@ fn main() {
 				'--threads' { if i + 1 < args.len { threads = u8(args[i+1].int()); i++ } }
 				'--prime' { if i + 1 < args.len { prime_bits = args[i+1].int(); i++ } }
 				'--pbkdf2-iter' { if i + 1 < args.len { pbkdf2_iter = args[i+1].int(); i++ } }
+				'-sh', '--shred' { shred_orig = true }
 				else {}
 			}
 		}
@@ -1668,11 +1707,11 @@ fn main() {
 		}
 
 		if mode == 'encrypt' {
-			locktime_encrypt_flow(file_path, out_path, duration, password, mem, iter, threads, prime_bits, pbkdf2_iter) or {
+			locktime_encrypt_flow(file_path, out_path, duration, password, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig) or {
 				println('[-] Encryption Error: ${err}')
 			}
 		} else if mode == 'decrypt' {
-			locktime_decrypt_flow(file_path, out_path, password, pbkdf2_iter) or {
+			locktime_decrypt_flow(file_path, out_path, password, pbkdf2_iter, shred_orig) or {
 				println('[-] Decryption Error: ${err}')
 			}
 		}
@@ -1696,6 +1735,7 @@ fn main() {
 				'-d', '--deobfuscate' { deobfuscate = true }
 				'-ni', '--noise-intensity' { if i + 1 < args.len { noise_intensity = args[i + 1].int(); i++ } }
 				'-nc', '--noise-chars' { if i + 1 < args.len { noise_chars_str = args[i + 1]; i++ } }
+				'-sh', '--shred' { shred_orig = true }
 				else {}
 			}
 		}
