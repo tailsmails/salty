@@ -5,7 +5,7 @@ Salty is a lightweight, high-performance command-line utility written in V for s
 ## Features
 
 ### 1. Locktime Engine (Sequential Time-Lock Cryptography)
-- **RSW96 & Pietrzak VDF with Password-Derived Base**: Secures files by requiring sequential modular squarings ($x_{i+1} = x_i^2 \pmod N$) that cannot be parallelized. Crucially, the starting base $a$ is dynamically derived on the fly from the Master Password and the file salt ($a = \text{Hash}(\text{MasterPassword} + \text{file\_salt}) \pmod N$) and is *never* stored in the file's public metadata.
+- **RSW96 & Pietrzak VDF with Password-Derived Base**: Secures files by requiring sequential modular squarings ($x_{i+1} = x_i^2 \pmod N$) that cannot be parallelized. Crucially, the starting base $a$ is dynamically derived on the fly from the Master Password and the file salt ($a = \text{Hash}(\text{MasterPassword} + \text{salt}) \pmod N$) and is *never* stored in the file's public metadata.
 - **Offline Brute-Force Immunity (Asymmetric Proof-of-Work)**: Because the VDF base $a$ is cryptographically bound to the password, an attacker cannot solve the puzzle once and then rapidly brute-force passwords offline. Testing any password guess forces the attacker to solve the $T$-second sequential VDF all over again, escalating the total brute-force cost from $T + N \times (\text{Fast KDF})$ to $N \times T$ (where $N$ is the number of guesses).
 - **Triple-Key Security Model (Oracle-Resistance)**: 
     - **Master Password**: Used for ChaCha20/Argon2id encryption.
