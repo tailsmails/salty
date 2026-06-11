@@ -68,6 +68,11 @@ struct DecryptSpot {
 	radix int
 }
 
+struct ProofIndex {
+mut:
+	val int
+}
+
 fn pad_left_zero(val int, width int) string {
 	mut s := val.str()
 	for s.len < width { s = '0' + s }
@@ -852,6 +857,87 @@ fn run_calibration(n big.Integer) u64 {
 	return u64(steps_per_ms)
 }
 
+fn modular_squaring(x big.Integer, t u64, n big.Integer) big.Integer {
+	mut res := x
+	for _ in 0 .. t {
+		res = (res * res) % n
+	}
+	return res
+}
+
+fn hash_to_challenge(x big.Integer, y big.Integer, v big.Integer, n big.Integer) big.Integer {
+	mut data := []u8{}
+	for b in x.str().bytes() { data << b }
+	for b in y.str().bytes() { data << b }
+	for b in v.str().bytes() { data << b }
+	for b in n.str().bytes() { data << b }
+	hash := sha512.sum512(data)
+	hex_str := hash[0..32].hex()
+	return big.integer_from_radix(hex_str, 16) or { big.integer_from_int(0) }
+}
+
+fn pietrzak_prove(x big.Integer, y big.Integer, t u64, n big.Integer, mut proof []big.Integer) ! {
+	if t == 1 {
+		return
+	}
+	half := t / 2
+	v := modular_squaring(x, half, n)
+	proof << v
+	r := hash_to_challenge(x, y, v, n)
+	x_prime := (x.big_mod_pow(r, n)! * v) % n
+	y_prime := (v.big_mod_pow(r, n)! * y) % n
+	pietrzak_prove(x_prime, y_prime, half, n, mut proof)!
+}
+
+fn pietrzak_verify(x big.Integer, y big.Integer, t u64, proof []big.Integer, n big.Integer) !bool {
+	mut p_idx := ProofIndex{ val: 0 }
+	return pietrzak_verify_recursive(x, y, t, proof, mut p_idx, n)
+}
+
+fn pietrzak_verify_recursive(x big.Integer, y big.Integer, t u64, proof []big.Integer, mut p_idx ProofIndex, n big.Integer) !bool {
+	if t == 1 {
+		return y == (x * x) % n
+	}
+	if p_idx.val >= proof.len {
+		return false
+	}
+	v := proof[p_idx.val]
+	p_idx.val++
+	half := t / 2
+	r := hash_to_challenge(x, y, v, n)
+	x_prime := (x.big_mod_pow(r, n)! * v) % n
+	y_prime := (v.big_mod_pow(r, n)! * y) % n
+	return pietrzak_verify_recursive(x_prime, y_prime, half, proof, mut p_idx, n)
+}
+
+fn serialize_proof(mut b []u8, proof []big.Integer) {
+	b << u8(proof.len)
+	for item in proof {
+		s_bytes := item.str().bytes()
+		write_u16(mut b, u16(s_bytes.len))
+		for byte in s_bytes {
+			b << byte
+		}
+	}
+}
+
+fn deserialize_proof(b []u8, mut offset ProofIndex) ![]big.Integer {
+	if offset.val >= b.len { return error('Malformed metadata: proof count offset out of bounds') }
+	count := b[offset.val]
+	offset.val++
+	mut proof := []big.Integer{cap: int(count)}
+	for _ in 0 .. count {
+		if offset.val + 2 > b.len { return error('Malformed metadata: proof item length out of bounds') }
+		item_len := read_u16(b, offset.val)
+		offset.val += 2
+		if offset.val + int(item_len) > b.len { return error('Malformed metadata: proof item bytes out of bounds') }
+		item_str := b[offset.val .. offset.val + int(item_len)].bytestr()
+		offset.val += int(item_len)
+		proof << big.integer_from_string(item_str) or { return error('Malformed metadata: invalid proof big integer') }
+	}
+	return proof
+}
+
 fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed_key1 string, seed_key2 string, mem u32, iter u32, threads u8, prime_bits int) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 
@@ -865,7 +951,14 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	phi_n := (p - one) * (q - one)
 
 	steps_per_ms := run_calibration(n)
-	t_val := duration_sec * steps_per_ms * 1000
+	mut t_val := duration_sec * steps_per_ms * 1000
+	
+	mut k := 0
+	for (u64(1) << (k + 1)) <= t_val {
+		k++
+	}
+	t_val = u64(1) << k
+
 	t_big := big.integer_from_u64(t_val)
 	println('[+] Calculated squarings (t): ${t_val} operations for ${duration_sec} seconds lock')
 
@@ -875,6 +968,10 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 
 	w_hash := sha512.sum512(w_trapdoor.str().bytes())
 	w_mask := w_hash[0..48]
+
+	println('[*] Generating Pietrzak VDF verification proof...')
+	mut proof := []big.Integer{}
+	pietrzak_prove(a, w_trapdoor, t_val, n, mut proof)!
 
 	println('[*] Deriving key with Argon2id (Memory: ${mem}KB, Iterations: ${iter})...')
 	mut lcg_rng := SecurePRNG{seed: [u8(5), 6, 7, 8]}
@@ -893,8 +990,9 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 
 	hash_final := sha512.sum512(final_key_bytes)
 
-	chacha_key := hash_final[0..32].hex()
-	chacha_iv := hash_final[32..48].hex()
+	chacha_pass := hash_final[0..48].hex()
+	os.setenv('CHACHA_PASS', chacha_pass, true)
+	defer { os.setenv('CHACHA_PASS', '', true) }
 
 	println('[*] Deriving independent Seed 1 and Seed 2 keys...')
 	seed_bytes1 := sha512.sum512(seed_key1.bytes()).clone()
@@ -915,7 +1013,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	}
 
 	println('[*] Running OpenSSL ChaCha20 encryption engine...')
-	openssl_cmd := 'openssl enc -chacha20 -e -in ${os.quoted_path(tmp_comp_file)} -out ${os.quoted_path(tmp_cipher_file)} -K ${chacha_key} -iv ${chacha_iv}'
+	openssl_cmd := 'openssl enc -chacha20 -e -pass env:CHACHA_PASS -pbkdf2 -iter 10000 -in ${os.quoted_path(tmp_comp_file)} -out ${os.quoted_path(tmp_cipher_file)}'
 	res := os.execute(openssl_cmd)
 	if res.exit_code != 0 { return error('OpenSSL execution failed. Ensure OpenSSL is installed.') }
 
@@ -942,6 +1040,8 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	for b in a_bytes { meta << b }
 	for b in ck_bytes { meta << b }
 
+	serialize_proof(mut meta, proof)
+
 	println('[*] Performing decoupled double-seed byte-level interleaving (No trial-leak)...')
 	data_len := meta.len + cipher_bytes.len
 	total_len := data_len * 2
@@ -952,7 +1052,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	for b in seed_bytes2 { mixed_seed << b }
 	mut junk_rng := SecurePRNG{seed: mixed_seed}
 	for i in 0 .. total_len {
-		mixed[i] = junk_rng.next_u8()
+		mixed[i] = u8(junk_rng.next_u8() & 0xFF)
 	}
 	
 	mut all_indices := []int{len: total_len}
@@ -1050,12 +1150,12 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	cipher_len := read_u32(meta_prefix, offset)
 	offset += 4
 
-	meta_total_len := 43 + int(n_len) + int(a_len) + int(ck_len)
+	meta_total_len := total_len / 2 - int(cipher_len)
 	if total_len < meta_total_len + int(cipher_len) {
 		return error('Extracted parameters exceed file boundary. Invalid Seed Key 1 or corrupted file.')
 	}
 
-	mut var_meta := []u8{len: int(n_len) + int(a_len) + int(ck_len)}
+	mut var_meta := []u8{len: meta_total_len - 43}
 	for i in 0 .. var_meta.len {
 		var_meta[i] = mixed[all_indices[43 + i]]
 	}
@@ -1066,6 +1166,17 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 
 	n := big.integer_from_string(n_str) or { return error('Invalid N') }
 	a := big.integer_from_string(a_str) or { return error('Invalid a') }
+	w_trapdoor := big.integer_from_string(ck_str) or { return error('Invalid CK') }
+
+	mut proof_offset := ProofIndex{ val: int(n_len) + int(a_len) + int(ck_len) }
+	proof := deserialize_proof(var_meta, mut proof_offset)!
+
+	println('[*] Instantly verifying mathematical validity of the time-lock puzzle via Pietrzak VDF...')
+	proof_ok := pietrzak_verify(a, w_trapdoor, t_val, proof, n)!
+	if !proof_ok {
+		return error('Pietrzak VDF verification failed! The time-lock puzzle has been corrupted or tampered with.')
+	}
+	println('[+] Pietrzak VDF verification passed. Puzzle is mathematically valid.')
 
 	mut remaining_indices := []int{cap: total_len - meta_total_len}
 	for i in meta_total_len .. total_len {
@@ -1119,8 +1230,9 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 
 	hash_final := sha512.sum512(final_key_bytes)
 
-	chacha_key := hash_final[0..32].hex()
-	chacha_iv := hash_final[32..48].hex()
+	chacha_pass := hash_final[0..48].hex()
+	os.setenv('CHACHA_PASS', chacha_pass, true)
+	defer { os.setenv('CHACHA_PASS', '', true) }
 
 	temp_dir := os.join_path(os.temp_dir(), 'lt_dec_${os.getpid()}')
 	os.mkdir(temp_dir)!
@@ -1133,7 +1245,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	os.write_bytes(tmp_cipher_file, cipher_bytes)!
 
 	println('[*] Running OpenSSL ChaCha20 decryption engine...')
-	openssl_cmd := 'openssl enc -chacha20 -d -in ${os.quoted_path(tmp_cipher_file)} -out ${os.quoted_path(tmp_comp_file)} -K ${chacha_key} -iv ${chacha_iv}'
+	openssl_cmd := 'openssl enc -chacha20 -d -pass env:CHACHA_PASS -pbkdf2 -iter 10000 -in ${os.quoted_path(tmp_cipher_file)} -out ${os.quoted_path(tmp_comp_file)}'
 	res := os.execute(openssl_cmd)
 	if res.exit_code != 0 { return error('Decryption failed. Wrong password or corrupted puzzle data.') }
 
