@@ -619,7 +619,13 @@ fn decrypt_number_flow(carrier_text string, password string, seed u64, formats [
 	}
 
 	dec_str := original_chunks.join('')
+	if dec_str.len < 4 {
+		return error('Malformed decrypted structure: data is too short')
+	}
 	payload_len := dec_str[0 .. 4].int()
+	if payload_len < 0 || 4 + payload_len > dec_str.len {
+		return error('Malformed decrypted structure: payload length out of bounds')
+	}
 	dec_payload := dec_str[4 .. 4 + payload_len]
 
 	big_int := big.integer_from_string(dec_payload)!
@@ -980,10 +986,10 @@ fn deserialize_proof(b []u8, mut offset ProofIndex) ![]big.Integer {
 	offset.val++
 	mut proof := []big.Integer{cap: int(count)}
 	for _ in 0 .. count {
-		if offset.val + 2 > b.len { return error('Malformed metadata: proof item length out of bounds') }
+		if offset.val > b.len - 2 { return error('Malformed metadata: proof item length out of bounds') }
 		item_len := read_u16(b, offset.val)
 		offset.val += 2
-		if offset.val + int(item_len) > b.len { return error('Malformed metadata: proof item bytes out of bounds') }
+		if int(item_len) > b.len - offset.val { return error('Malformed metadata: proof item bytes out of bounds') }
 		item_str := b[offset.val .. offset.val + int(item_len)].bytestr()
 		offset.val += int(item_len)
 		proof << big.integer_from_string(item_str) or { return error('Malformed metadata: invalid proof big integer') }
@@ -1057,9 +1063,11 @@ fn deserialize_vdf_params(b []u8) !VdfParams {
 	n_len := read_u16(b, 0)
 	a_len := read_u16(b, 2)
 	t := read_u64(b, 4)
-	if 12 + int(n_len) + int(a_len) > b.len { return error('Malformed VDF params boundaries') }
-	n_str := b[12 .. 12 + n_len].bytestr()
-	a_str := b[12 + n_len .. 12 + n_len + a_len].bytestr()
+	if int(n_len) > b.len - 12 || int(a_len) > b.len - 12 - int(n_len) {
+		return error('Malformed VDF params boundaries')
+	}
+	n_str := b[12 .. 12 + int(n_len)].bytestr()
+	a_str := b[12 + int(n_len) .. 12 + int(n_len) + int(a_len)].bytestr()
 	n := big.integer_from_string(n_str)!
 	a := big.integer_from_string(a_str)!
 	return VdfParams{ n: n, a: a, t: t }
@@ -1325,12 +1333,10 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	mut rem_space := total_len - 6
 	if rem_space < 2 { rem_space = 2 }
 
-	if safe_vdf_len <= 0 || safe_enc_header_len <= 0 || safe_vdf_len + safe_enc_header_len > rem_space {
+	if safe_vdf_len <= 0 || safe_enc_header_len <= 0 || safe_vdf_len > rem_space || safe_enc_header_len > rem_space || safe_vdf_len + safe_enc_header_len > rem_space {
 		safe_vdf_len = rem_space / 2
 		safe_enc_header_len = rem_space - safe_vdf_len
 	}
-	if safe_vdf_len < 1 { safe_vdf_len = 1 }
-	if safe_enc_header_len < 1 { safe_enc_header_len = 1 }
 
 	meta_total_len := 6 + safe_vdf_len + safe_enc_header_len
 
