@@ -109,8 +109,6 @@ Metamorphose text using visual twins and noise to make it unreadable for AI filt
 | `-f` | `--file` | Input file path | Locktime |
 | `-o` | `--out` | Output file path | Locktime / Salty |
 | `-t` | `--time` | Time-lock duration in seconds (Default: 10) | Locktime |
-| `-s1`| `--seed1` | Second key (Seed 1 - Metadata Shuffle) | Locktime |
-| `-s2`| `--seed2` | Third key (Seed 2 - Payload Shuffle) | Locktime |
 | `--mem`| — | Argon2 Memory in KB (Default: 65536) | Locktime |
 | `--iter`| — | Argon2 Iterations (Default: 3) | Locktime |
 | `--threads`| — | Argon2 Threads (Default: 4) | Locktime |
