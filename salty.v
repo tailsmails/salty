@@ -1,9 +1,51 @@
+module main
+
 import os
 import math.big
+import crypto.argon2
+import crypto.sha512
+import time
+
+struct SecurePRNG {
+mut:
+	seed []u8
+	counter u64
+	buffer []u8
+	idx int
+}
+
+fn (mut rng SecurePRNG) next_u8() u8 {
+	if rng.idx >= rng.buffer.len {
+		mut state := []u8{cap: rng.seed.len + 8}
+		for b in rng.seed { state << b }
+		mut temp := []u8{}
+		write_u64(mut temp, rng.counter)
+		for b in temp { state << b }
+		rng.counter++
+		rng.buffer = sha512.sum512(state).clone()
+		rng.idx = 0
+	}
+	val := rng.buffer[rng.idx]
+	rng.idx++
+	return val
+}
+
+fn (mut rng SecurePRNG) next_u32() u32 {
+	b0 := rng.next_u8()
+	b1 := rng.next_u8()
+	b2 := rng.next_u8()
+	b3 := rng.next_u8()
+	return (u32(b0) << 24) | (u32(b1) << 16) | (u32(b2) << 8) | u32(b3)
+}
+
+fn (mut rng SecurePRNG) intn(n int) int {
+	if n <= 0 { return 0 }
+	return int(rng.next_u32() % u32(n))
+}
 
 struct LCG {
-	mut:
-		state u64
+mut:
+	state u64
 }
 
 fn (mut rng LCG) next() u32 {
@@ -105,23 +147,23 @@ fn hex_to_bytes(hex_str string) ![]u8 {
 }
 
 fn openssl_encrypt(plaintext string, password string) !string {
-	tmp_plain := os.join_path(os.temp_dir(), 'plain_${os.getpid()}.txt')
-	tmp_comp := os.join_path(os.temp_dir(), 'comp_${os.getpid()}.zst')
-	tmp_enc := os.join_path(os.temp_dir(), 'enc_${os.getpid()}.bin')
+	temp_dir := os.join_path(os.temp_dir(), 'st_enc_${os.getpid()}')
+	os.mkdir(temp_dir)!
+	os.chmod(temp_dir, 0o700) or {}
+	defer { os.rmdir_all(temp_dir) or {} }
 
-	defer {
-		os.rm(tmp_plain) or {}
-		os.rm(tmp_comp) or {}
-		os.rm(tmp_enc) or {}
-	}
+	tmp_plain := os.join_path(temp_dir, 'plain.txt')
+	tmp_comp := os.join_path(temp_dir, 'comp.zst')
+	tmp_enc := os.join_path(temp_dir, 'enc.bin')
 
 	os.write_file(tmp_plain, plaintext)!
-	zstd_res := os.execute('zstd -19 -q -f ${tmp_plain} -o ${tmp_comp}')
+	zstd_res := os.execute('zstd -19 -q -f ${os.quoted_path(tmp_plain)} -o ${os.quoted_path(tmp_comp)}')
 	if zstd_res.exit_code != 0 { return error('ZSTD compression failed') }
 
 	os.setenv('SALTY_PASS', password, true)
-	res := os.execute('openssl enc -chacha20 -pass env:SALTY_PASS -pbkdf2 -iter 10000 -in ${tmp_comp} -out ${tmp_enc}')
-	os.setenv('SALTY_PASS', '', true)
+	defer { os.setenv('SALTY_PASS', '', true) }
+
+	res := os.execute('openssl enc -chacha20 -pass env:SALTY_PASS -pbkdf2 -iter 10000 -in ${os.quoted_path(tmp_comp)} -out ${os.quoted_path(tmp_enc)}')
 
 	if res.exit_code != 0 { return error('OpenSSL failed') }
 	enc_bytes := os.read_bytes(tmp_enc)!
@@ -129,26 +171,26 @@ fn openssl_encrypt(plaintext string, password string) !string {
 }
 
 fn openssl_decrypt(hex_ciphertext string, password string) !string {
-	tmp_enc := os.join_path(os.temp_dir(), 'enc_${os.getpid()}.bin')
-	tmp_comp := os.join_path(os.temp_dir(), 'comp_${os.getpid()}.zst')
-	tmp_plain := os.join_path(os.temp_dir(), 'plain_${os.getpid()}.txt')
+	temp_dir := os.join_path(os.temp_dir(), 'st_dec_${os.getpid()}')
+	os.mkdir(temp_dir)!
+	os.chmod(temp_dir, 0o700) or {}
+	defer { os.rmdir_all(temp_dir) or {} }
 
-	defer {
-		os.rm(tmp_enc) or {}
-		os.rm(tmp_comp) or {}
-		os.rm(tmp_plain) or {}
-	}
+	tmp_enc := os.join_path(temp_dir, 'enc.bin')
+	tmp_comp := os.join_path(temp_dir, 'comp.zst')
+	tmp_plain := os.join_path(temp_dir, 'plain.txt')
 
 	enc_bytes := hex_to_bytes(hex_ciphertext)!
 	os.write_bytes(tmp_enc, enc_bytes)!
 
 	os.setenv('SALTY_PASS', password, true)
-	res := os.execute('openssl enc -chacha20 -d -pass env:SALTY_PASS -pbkdf2 -iter 10000 -in ${tmp_enc} -out ${tmp_comp}')
-	os.setenv('SALTY_PASS', '', true)
+	defer { os.setenv('SALTY_PASS', '', true) }
+
+	res := os.execute('openssl enc -chacha20 -d -pass env:SALTY_PASS -pbkdf2 -iter 10000 -in ${os.quoted_path(tmp_enc)} -out ${os.quoted_path(tmp_comp)}')
 
 	if res.exit_code != 0 { return error('OpenSSL decryption failed (Wrong password?)') }
 
-	zstd_res := os.execute('zstd -d -q -f ${tmp_comp} -o ${tmp_plain}')
+	zstd_res := os.execute('zstd -d -q -f ${os.quoted_path(tmp_comp)} -o ${os.quoted_path(tmp_plain)}')
 	if zstd_res.exit_code != 0 { return error('ZSTD decompression failed') }
 
 	plaintext := os.read_file(tmp_plain)!
@@ -263,9 +305,9 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed u
 			if use_swap && i < runes.len - 1 && runes[i] != runes[i+1] {
 				mut rem := 0
 				if p > zero {
-					radix_big := big.integer_from_int(2)
-					rem = (p % radix_big).str().int()
-					p = p / radix_big
+					text_radix_big := big.integer_from_int(2)
+					rem = (p % text_radix_big).str().int()
+					p = p / text_radix_big
 				} else {
 					rem = 0 
 				}
@@ -656,33 +698,493 @@ fn apply_deobfuscation(text string, m map[string][]string, noise_chars []rune) s
 	return out
 }
 
-fn print_help() {
-	println('Usage: salty [encrypt|decrypt|obfuscate] [options]')
-	println('Or simply run: salty (for interactive mode)')
-	println('\nGeneral Options:')
-	println('  -m, --message "<str>"      Plaintext message to encrypt')
-	println('  -t, --text "<str>"         Cover text (for Encrypt) OR Carrier text (for Decrypt)')
-	println('  -p, --pass "<str>"         OpenSSL encryption password')
-	println('  -s, --seed <u64>           Deterministic seed')
-	println('\nMethod 1: Number Steganography Options:')
-	println('  -f, --formats "<str>"      Comma-separated list of formats (e.g. "+98912:7,6037:10")')
-	println('\nMethod 2: Text Steganography (Typo) Options:')
-	println('  -ti, --typo-intensity <int> Intensity of typos (e.g. 30)')
-	println('  -tc, --typo-chars "<str>"  Custom typo letters (e.g. "a,z,c")')
-	println('  -km, --key-map "<str>"     Custom keyboard map (e.g. "ضصث...")')
-	println('  -q, --qwerty               Enable English QWERTY mode')
-	println('  -o, --overwrite            OVERWRITE characters instead of inserting them')
-	println('  -tr, --transpose           Transpose (swap) adjacent characters')
-	println('  -r, --ref "<str>"          Original Reference Text (REQUIRED for Overwrite/Transpose Decrypt)')
-	println('\nMethod 3: Custom Visual Obfuscation (Homoglyphs & Noise Injection):')
-	println('  -map, --mapping "<str>"    Manual map for replacements (Format: "from:to1:to2,from:to")')
-	println('  -ni, --noise-intensity <int> Intensity of noise injection (0-100)')
-	println('  -nc, --noise-chars "<str>" Custom noise symbols (or empty for auto-pool)')
-	println('  -d, --deobfuscate          Reverse the manual map (Deobfuscate)')
-	println('  -h, --help                 Show this help message')
+fn write_u16(mut b []u8, val u16) {
+	b << u8(val >> 8)
+	b << u8(val)
 }
 
-fn run_interactive() ! {
+fn read_u16(b []u8, offset int) u16 {
+	return (u16(b[offset]) << 8) | u16(b[offset + 1])
+}
+
+fn write_u32(mut b []u8, val u32) {
+	b << u8(val >> 24)
+	b << u8(val >> 16)
+	b << u8(val >> 8)
+	b << u8(val)
+}
+
+fn read_u32(b []u8, offset int) u32 {
+	return (u32(b[offset]) << 24) | (u32(b[offset + 1]) << 16) | (u32(b[offset + 2]) << 8) | u32(b[offset + 3])
+}
+
+fn write_u64(mut b []u8, val u64) {
+	b << u8(val >> 56)
+	b << u8(val >> 48)
+	b << u8(val >> 40)
+	b << u8(val >> 32)
+	b << u8(val >> 24)
+	b << u8(val >> 16)
+	b << u8(val >> 8)
+	b << u8(val)
+}
+
+fn read_u64(b []u8, offset int) u64 {
+	mut val := u64(0)
+	for i in 0 .. 8 {
+		val = (val << 8) | u64(b[offset + i])
+	}
+	return val
+}
+
+fn zeroize(mut b []u8) {
+	for i in 0 .. b.len {
+		b[i] = 0
+	}
+}
+
+fn is_obviously_composite(n big.Integer) bool {
+	small_primes := [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113]
+	zero := big.integer_from_int(0)
+	for p in small_primes {
+		bp := big.integer_from_int(p)
+		if n == bp { return false }
+		if n % bp == zero { return true }
+	}
+	return false
+}
+
+fn is_prime_mr(n big.Integer, k int) bool {
+	zero := big.integer_from_int(0)
+	one := big.integer_from_int(1)
+	two := big.integer_from_int(2)
+	three := big.integer_from_int(3)
+	
+	if n < two { return false }
+	if n == two || n == three { return true }
+	if n % two == zero { return false }
+
+	n_minus_1 := n - one
+	mut d := n_minus_1
+	mut s := 0
+	for (d % two) == zero {
+		d = d / two
+		s++
+	}
+
+	mut seed := []u8{}
+	write_u64(mut seed, u64(time.now().unix_nano()))
+	mut rng := SecurePRNG{seed: seed}
+	for _ in 0 .. k {
+		witnesses := [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+		w_val := witnesses[rng.intn(witnesses.len)]
+		a := big.integer_from_int(w_val)
+		if a >= n_minus_1 { continue }
+
+		mut x := a.big_mod_pow(d, n) or { return false }
+		if x == one || x == n_minus_1 {
+			continue
+		}
+
+		mut composite := true
+		for _ in 0 .. s - 1 {
+			x = (x * x) % n
+			if x == n_minus_1 {
+				composite = false
+				break
+			}
+			if x == one {
+				return false
+			}
+		}
+		if composite {
+			return false
+		}
+	}
+	return true
+}
+
+fn generate_prime(bits int) big.Integer {
+	mut seed := []u8{}
+	write_u64(mut seed, u64(time.now().unix_nano()))
+	mut rng := SecurePRNG{seed: seed}
+	for {
+		mut bytes := []u8{len: bits / 8}
+		for i in 0 .. bytes.len {
+			bytes[i] = rng.next_u8()
+		}
+		bytes[0] |= 0x80
+		bytes[bytes.len - 1] |= 0x01
+		
+		hex_str := bytes.hex()
+		num := big.integer_from_radix(hex_str, 16) or { continue }
+		
+		if is_obviously_composite(num) { continue }
+		if is_prime_mr(num, 8) {
+			return num
+		}
+	}
+	return big.integer_from_int(0)
+}
+
+fn xor_bytes(a []u8, b []u8) []u8 {
+	mut res := []u8{len: a.len}
+	for i in 0 .. a.len {
+		res[i] = a[i] ^ b[i]
+	}
+	return res
+}
+
+fn run_calibration(n big.Integer) u64 {
+	println('[*] Calibrating single-thread CPU performance for RSW96...')
+	a := big.integer_from_int(2)
+	test_steps := u64(10000)
+	
+	start := time.now()
+	mut x := a
+	for _ in 0 .. test_steps {
+		x = (x * x) % n
+	}
+	duration := time.since(start).milliseconds()
+	
+	mut steps_per_ms := f64(test_steps) / f64(if duration == 0 { 1 } else { duration })
+	println('[+] CPU speed: ${steps_per_ms:.2f} squarings/ms')
+	return u64(steps_per_ms)
+}
+
+fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed_key1 string, seed_key2 string, mem u32, iter u32, threads u8, prime_bits int) ! {
+	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
+
+	println('[*] Generating dynamic prime \$p (${prime_bits} bits)...')
+	p := generate_prime(prime_bits)
+	println('[*] Generating dynamic prime \$q (${prime_bits} bits)...')
+	q := generate_prime(prime_bits)
+	
+	n := p * q
+	one := big.integer_from_int(1)
+	phi_n := (p - one) * (q - one)
+
+	steps_per_ms := run_calibration(n)
+	t_val := duration_sec * steps_per_ms * 1000
+	t_big := big.integer_from_u64(t_val)
+	println('[+] Calculated squarings (t): ${t_val} operations for ${duration_sec} seconds lock')
+
+	a := big.integer_from_int(2)
+	e := big.integer_from_int(2).big_mod_pow(t_big, phi_n)!
+	w_trapdoor := a.big_mod_pow(e, n)!
+
+	w_hash := sha512.sum512(w_trapdoor.str().bytes())
+	w_mask := w_hash[0..48]
+
+	println('[*] Deriving key with Argon2id (Memory: ${mem}KB, Iterations: ${iter})...')
+	mut lcg_rng := SecurePRNG{seed: [u8(5), 6, 7, 8]}
+	mut salt := []u8{len: 16}
+	for i in 0 .. 16 { salt[i] = lcg_rng.next_u8() }
+
+	mut argon_key := argon2.d_key(password.bytes(), salt, iter, mem, threads, 48)!
+	defer {
+		zeroize(mut argon_key)
+	}
+
+	mut final_key_bytes := xor_bytes(argon_key, w_mask)
+	defer {
+		zeroize(mut final_key_bytes)
+	}
+
+	hash_final := sha512.sum512(final_key_bytes)
+
+	chacha_key := hash_final[0..32].hex()
+	chacha_iv := hash_final[32..48].hex()
+
+	println('[*] Deriving independent Seed 1 and Seed 2 keys...')
+	seed_bytes1 := sha512.sum512(seed_key1.bytes()).clone()
+	seed_bytes2 := sha512.sum512(seed_key2.bytes()).clone()
+
+	temp_dir := os.join_path(os.temp_dir(), 'lt_enc_${os.getpid()}')
+	os.mkdir(temp_dir)!
+	os.chmod(temp_dir, 0o700) or {}
+	defer { os.rmdir_all(temp_dir) or {} }
+
+	tmp_comp_file := os.join_path(temp_dir, 'lt_comp.zst')
+	tmp_cipher_file := os.join_path(temp_dir, 'lt_tmp.bin')
+
+	println('[*] Compressing payload with ZSTD (Level 19)...')
+	zstd_res := os.execute('zstd -19 -q -f ${os.quoted_path(file_path)} -o ${os.quoted_path(tmp_comp_file)}')
+	if zstd_res.exit_code != 0 {
+		return error('ZSTD compression failed. Make sure "zstd" command is installed.')
+	}
+
+	println('[*] Running OpenSSL ChaCha20 encryption engine...')
+	openssl_cmd := 'openssl enc -chacha20 -e -in ${os.quoted_path(tmp_comp_file)} -out ${os.quoted_path(tmp_cipher_file)} -K ${chacha_key} -iv ${chacha_iv}'
+	res := os.execute(openssl_cmd)
+	if res.exit_code != 0 { return error('OpenSSL execution failed. Ensure OpenSSL is installed.') }
+
+	cipher_bytes := os.read_bytes(tmp_cipher_file)!
+
+	println('[*] Serializing dynamic binary metadata block...')
+	mut meta := []u8{}
+	for b in salt { meta << b }
+	write_u32(mut meta, iter)
+	write_u32(mut meta, mem)
+	meta << threads
+	write_u64(mut meta, t_val)
+	
+	n_bytes := n.str().bytes()
+	a_bytes := a.str().bytes()
+	ck_bytes := w_trapdoor.str().bytes()
+	
+	write_u16(mut meta, u16(n_bytes.len))
+	write_u16(mut meta, u16(a_bytes.len))
+	write_u16(mut meta, u16(ck_bytes.len))
+	write_u32(mut meta, u32(cipher_bytes.len))
+	
+	for b in n_bytes { meta << b }
+	for b in a_bytes { meta << b }
+	for b in ck_bytes { meta << b }
+
+	println('[*] Performing decoupled double-seed byte-level interleaving (No trial-leak)...')
+	data_len := meta.len + cipher_bytes.len
+	total_len := data_len * 2
+	
+	mut mixed := []u8{len: total_len}
+	mut mixed_seed := []u8{cap: 128}
+	for b in seed_bytes1 { mixed_seed << b }
+	for b in seed_bytes2 { mixed_seed << b }
+	mut junk_rng := SecurePRNG{seed: mixed_seed}
+	for i in 0 .. total_len {
+		mixed[i] = junk_rng.next_u8()
+	}
+	
+	mut all_indices := []int{len: total_len}
+	for i in 0 .. total_len { all_indices[i] = i }
+	
+	mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
+	for i := total_len - 1; i > 0; i-- {
+		j := shuffle_rng1.intn(i + 1)
+		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
+	}
+	
+	meta_len := meta.len
+	mut meta_indices := []int{cap: meta_len}
+	for i in 0 .. meta_len {
+		meta_indices << all_indices[i]
+	}
+	
+	for i in 0 .. meta_len {
+		mixed[meta_indices[i]] = meta[i]
+	}
+	
+	mut remaining_indices := []int{cap: total_len - meta_len}
+	for i in meta_len .. total_len {
+		remaining_indices << all_indices[i]
+	}
+	
+	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
+	for i := remaining_indices.len - 1; i > 0; i-- {
+		j := shuffle_rng2.intn(i + 1)
+		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
+	}
+	
+	for i in 0 .. cipher_bytes.len {
+		mixed[remaining_indices[i]] = cipher_bytes[i]
+	}
+
+	os.write_bytes(out_path, mixed)!
+	println('[+] Homogeneous binary file successfully saved to: ${out_path}')
+}
+
+fn locktime_decrypt_flow(file_path string, out_path string, password string, seed_key1 string, seed_key2 string) ! {
+	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
+	
+	println('[*] Reading homogeneous raw binary file...')
+	mixed := os.read_bytes(file_path)!
+	total_len := mixed.len
+
+	if total_len < 43 {
+		return error('File is too small to contain valid metadata!')
+	}
+
+	seed_bytes1 := sha512.sum512(seed_key1.bytes()).clone()
+	seed_bytes2 := sha512.sum512(seed_key2.bytes()).clone()
+
+	mut all_indices := []int{len: total_len}
+	for i in 0 .. total_len { all_indices[i] = i }
+	
+	mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
+	for i := total_len - 1; i > 0; i-- {
+		j := shuffle_rng1.intn(i + 1)
+		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
+	}
+
+	mut meta_prefix := []u8{len: 43}
+	for i in 0 .. 43 {
+		meta_prefix[i] = mixed[all_indices[i]]
+	}
+
+	mut offset := 0
+	mut salt := []u8{len: 16}
+	for i in 0 .. 16 { salt[i] = meta_prefix[offset + i] }
+	offset += 16
+	
+	iter := read_u32(meta_prefix, offset)
+	offset += 4
+	
+	mem := read_u32(meta_prefix, offset)
+	offset += 4
+	
+	threads := meta_prefix[offset]
+	offset += 1
+	
+	t_val := read_u64(meta_prefix, offset)
+	offset += 8
+	
+	n_len := read_u16(meta_prefix, offset)
+	offset += 2
+	
+	a_len := read_u16(meta_prefix, offset)
+	offset += 2
+	
+	ck_len := read_u16(meta_prefix, offset)
+	offset += 2
+	
+	cipher_len := read_u32(meta_prefix, offset)
+	offset += 4
+
+	meta_total_len := 43 + int(n_len) + int(a_len) + int(ck_len)
+	if total_len < meta_total_len + int(cipher_len) {
+		return error('Extracted parameters exceed file boundary. Invalid Seed Key 1 or corrupted file.')
+	}
+
+	mut var_meta := []u8{len: int(n_len) + int(a_len) + int(ck_len)}
+	for i in 0 .. var_meta.len {
+		var_meta[i] = mixed[all_indices[43 + i]]
+	}
+
+	n_str := var_meta[0 .. n_len].bytestr()
+	a_str := var_meta[n_len .. n_len + a_len].bytestr()
+	ck_str := var_meta[n_len + a_len .. n_len + a_len + ck_len].bytestr()
+
+	n := big.integer_from_string(n_str) or { return error('Invalid N') }
+	a := big.integer_from_string(a_str) or { return error('Invalid a') }
+
+	mut remaining_indices := []int{cap: total_len - meta_total_len}
+	for i in meta_total_len .. total_len {
+		remaining_indices << all_indices[i]
+	}
+	
+	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
+	for i := remaining_indices.len - 1; i > 0; i-- {
+		j := shuffle_rng2.intn(i + 1)
+		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
+	}
+
+	mut cipher_bytes := []u8{len: int(cipher_len)}
+	for i in 0 .. int(cipher_len) {
+		cipher_bytes[i] = mixed[remaining_indices[i]]
+	}
+
+	println('[*] Deriving K_argon using Argon2id...')
+	mut argon_key := argon2.d_key(password.bytes(), salt, iter, mem, threads, 48)!
+	defer {
+		zeroize(mut argon_key)
+	}
+
+	mut final_key_bytes := []u8{}
+	defer {
+		zeroize(mut final_key_bytes)
+	}
+
+	println('[*] Resolving time-lock puzzle sequentially (t = ${t_val}). Please wait...')
+	start_time := time.now()
+	
+	mut x := a
+	for i in 0 .. t_val {
+		x = (x * x) % n
+		if i % (t_val / 10) == 0 && i > 0 {
+			println('  [>] Progress: ${(i * 100) / t_val}% finished...')
+		}
+	}
+	println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
+
+	if ck_str != '' && x.str() != ck_str {
+		println('[!] Warning: Solved puzzle value does not match the file\'s trapdoor value!')
+	} else {
+		println('[+] Puzzle mathematical verification passed.')
+	}
+
+	w_hash := sha512.sum512(x.str().bytes())
+	w_mask := w_hash[0..48]
+
+	final_key_bytes = xor_bytes(argon_key, w_mask)
+
+	hash_final := sha512.sum512(final_key_bytes)
+
+	chacha_key := hash_final[0..32].hex()
+	chacha_iv := hash_final[32..48].hex()
+
+	temp_dir := os.join_path(os.temp_dir(), 'lt_dec_${os.getpid()}')
+	os.mkdir(temp_dir)!
+	os.chmod(temp_dir, 0o700) or {}
+	defer { os.rmdir_all(temp_dir) or {} }
+
+	tmp_cipher_file := os.join_path(temp_dir, 'lt_dec_tmp.bin')
+	tmp_comp_file := os.join_path(temp_dir, 'lt_comp_tmp.zst')
+
+	os.write_bytes(tmp_cipher_file, cipher_bytes)!
+
+	println('[*] Running OpenSSL ChaCha20 decryption engine...')
+	openssl_cmd := 'openssl enc -chacha20 -d -in ${os.quoted_path(tmp_cipher_file)} -out ${os.quoted_path(tmp_comp_file)} -K ${chacha_key} -iv ${chacha_iv}'
+	res := os.execute(openssl_cmd)
+	if res.exit_code != 0 { return error('Decryption failed. Wrong password or corrupted puzzle data.') }
+
+	println('[*] Decompressing final file using ZSTD...')
+	zstd_res := os.execute('zstd -d -q -f ${os.quoted_path(tmp_comp_file)} -o ${os.quoted_path(out_path)}')
+	if zstd_res.exit_code != 0 {
+		return error('ZSTD decompression failed. Corrupted payload or wrong key material.')
+	}
+
+	println('[+] Decrypted file successfully saved to: ${out_path}')
+}
+
+fn print_help() {
+	println('Usage: locktime/salty [mode] [options]')
+	println('\nModes:')
+	println('  encrypt                    Encrypt a file (Locktime) or steganographic message (Salty)')
+	println('  decrypt                    Decrypt a file (Locktime) or steganographic carrier (Salty)')
+	println('  obfuscate                  Apply visual homoglyphs/noise mapping (Salty)')
+	println('  interactive                Run Salty interactive stego menu')
+	println('\nLocktime (Time-Lock Encryption) Options:')
+	println('  -f, --file <path>          Input file to encrypt/decrypt')
+	println('  -o, --out <path>           Output file path')
+	println('  -t, --time <seconds>       Time-lock duration in seconds (Default: 10)')
+	println('  -p, --pass <password>      Password')
+	println('  -s1, --seed1 <seed>        Second key (Seed 1 - Metadata Shuffle)')
+	println('  -s2, --seed2 <seed>        Third key (Seed 2 - Payload Shuffle)')
+	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
+	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
+	println('  --threads <count>          Argon2 Threads (Default: 4)')
+	println('  --prime <bits>             Size of dynamic primes in bits (Default: 512)')
+	println('\nSalty Steganography Options:')
+	println('  -m, --message <str>        Plaintext message to hide')
+	println('  -t, --text <str>           Cover text (for encrypt) or carrier text (for decrypt)')
+	println('  -p, --pass <password>      Encryption password')
+	println('  -s, --seed <number>        Deterministic u64 seed')
+	println('  -f, --formats <str>        Formats list (e.g., "+98912:7,6037:10")')
+	println('  -ti, --typo-intensity <n>  Intensity of typos (e.g., 30)')
+	println('  -tc, --typo-chars <str>    Custom typo letters')
+	println('  -km, --key-map <str>       Custom keyboard map')
+	println('  -q, --qwerty               Use QWERTY map')
+	println('  -o, --overwrite            Overwrite chars instead of inserting')
+	println('  -tr, --transpose           Transpose adjacent chars')
+	println('  -r, --ref <str>            Reference text (Required for Overwrite/Transpose decrypt)')
+	println('\nSalty Visual Obfuscation Options:')
+	println('  -map, --mapping <str>      Manual replacement map')
+	println('  -ni, --noise-intensity <n> Noise intensity (0-100)')
+	println('  -nc, --noise-chars <str>   Custom noise pool')
+	println('  -d, --deobfuscate          Deobfuscate text')
+}
+
+fn run_salty_interactive() ! {
 	println('=== SALTY INTERACTIVE MODE ===')
 	method := os.input('Choose Carrier Method (1: Fake Numbers, 2: Text Typos, 3: Custom Manual Obfuscation): ').trim_space()
 	
@@ -764,7 +1266,7 @@ fn run_interactive() ! {
 fn main() {
 	args := os.args
 	if args.len == 1 {
-		run_interactive() or { println('Error: ${err}') }
+		run_salty_interactive() or { println('Error: ${err}') }
 		return
 	}
 
@@ -774,11 +1276,34 @@ fn main() {
 	}
 
 	mode := args[1]
+	if mode == 'interactive' {
+		run_salty_interactive() or { println('Error: ${err}') }
+		return
+	}
+
 	if mode != 'encrypt' && mode != 'decrypt' && mode != 'obfuscate' {
 		println('Error: Mode must be "encrypt", "decrypt" or "obfuscate"')
 		print_help()
 		return
 	}
+
+	mut is_locktime := false
+	for a in args {
+		if a in ['-s1', '--seed1', '-s2', '--seed2', '--prime', '--threads', '--mem', '--iter'] {
+			is_locktime = true
+			break
+		}
+	}
+
+	mut file_path := ''
+	mut out_path := ''
+	mut duration := u64(10)
+	mut seed_key1 := ''
+	mut seed_key2 := ''
+	mut mem := u32(65536)
+	mut iter := u32(3)
+	mut threads := u8(4)
+	mut prime_bits := 512
 
 	mut message := ''
 	mut text_input := ''
@@ -797,79 +1322,117 @@ fn main() {
 	mut noise_intensity := 0
 	mut noise_chars_str := ''
 
-	for i := 2; i < args.len; i++ {
-		arg := args[i]
-		match arg {
-			'-m', '--message' { if i + 1 < args.len { message = args[i + 1]; i++ } }
-			'-t', '--text' { if i + 1 < args.len { text_input = args[i + 1]; i++ } }
-			'-r', '--ref' { if i + 1 < args.len { ref_text = args[i + 1]; i++ } }
-			'-p', '--pass' { if i + 1 < args.len { password = args[i + 1]; i++ } }
-			'-s', '--seed' { if i + 1 < args.len { seed_val = args[i + 1].u64(); i++ } }
-			'-f', '--formats' { if i + 1 < args.len { raw_formats = args[i + 1]; i++ } }
-			'-ti', '--typo-intensity' { if i + 1 < args.len { typo_intensity = args[i + 1].int(); i++ } }
-			'-tc', '--typo-chars' { if i + 1 < args.len { typo_chars = args[i + 1]; i++ } }
-			'-km', '--key-map' { if i + 1 < args.len { key_map = args[i + 1]; i++ } }
-			'-q', '--qwerty' { use_qwerty = true }
-			'-o', '--overwrite' { overwrite = true }
-			'-tr', '--transpose' { transpose = true }
-			'-map', '--mapping' { if i + 1 < args.len { mapping_str = args[i + 1]; i++ } }
-			'-d', '--deobfuscate' { deobfuscate = true }
-			'-ni', '--noise-intensity' { if i + 1 < args.len { noise_intensity = args[i + 1].int(); i++ } }
-			'-nc', '--noise-chars' { if i + 1 < args.len { noise_chars_str = args[i + 1]; i++ } }
-			else {}
+	if is_locktime {
+		for i := 2; i < args.len; i++ {
+			match args[i] {
+				'-f' { if i + 1 < args.len { file_path = args[i+1]; i++ } }
+				'-o' { if i + 1 < args.len { out_path = args[i+1]; i++ } }
+				'-t' { if i + 1 < args.len { duration = args[i+1].u64(); i++ } }
+				'-p' { if i + 1 < args.len { password = args[i+1]; i++ } }
+				'-s1', '--seed1' { if i + 1 < args.len { seed_key1 = args[i+1]; i++ } }
+				'-s2', '--seed2' { if i + 1 < args.len { seed_key2 = args[i+1]; i++ } }
+				'--mem' { if i + 1 < args.len { mem = args[i+1].u32(); i++ } }
+				'--iter' { if i + 1 < args.len { iter = args[i+1].u32(); i++ } }
+				'--threads' { if i + 1 < args.len { threads = u8(args[i+1].int()); i++ } }
+				'--prime' { if i + 1 < args.len { prime_bits = args[i+1].int(); i++ } }
+				else {}
+			}
 		}
-	}
 
-	if mode == 'obfuscate' {
-		if text_input == '' {
-			println('Error: Text is required (-t or --text)')
-			return
+		if password == '' {
+			password = os.input_password('Enter First Key (Password): ') or { panic(err) }
 		}
-		if mapping_str == '' {
-			println('Error: Mapping string is required (-map or --mapping)')
-			return
+		if seed_key1 == '' {
+			seed_key1 = os.input_password('Enter Second Key (Seed 1 - Metadata Shuffle): ') or { panic(err) }
 		}
-		m := parse_mapping(mapping_str)
-		noise_chars := get_noise_chars(noise_chars_str)
+		if seed_key2 == '' {
+			seed_key2 = os.input_password('Enter Third Key (Seed 2 - Payload Shuffle): ') or { panic(err) }
+		}
 
-		if deobfuscate {
-			result := apply_deobfuscation(text_input, m, noise_chars)
-			println('=== DE-OBFUSCATED TEXT ===\n' + result)
-		} else {
-			result := apply_obfuscation(text_input, m, noise_intensity, noise_chars, seed_val)
-			println('=== OBFUSCATED TEXT ===\n' + result)
-		}
-		return
-	}
-
-	if password == '' {
-		println('Error: Password is required (-p or --pass)')
-		return
-	}
-
-	if raw_formats != '' {
-		formats := parse_formats(raw_formats) or {
-			println('Format parse error: ${err}')
-			return
-		}
 		if mode == 'encrypt' {
-			if message == '' { println('Error: Message required (-m)'); return }
-			encrypt_number_flow(message, password, seed_val, formats) or { println('Encryption failed: ${err}') }
-		} else {
-			if text_input == '' { println('Error: Carrier text required (-t)'); return }
-			decrypt_number_flow(text_input, password, seed_val, formats) or { println('Decryption failed: ${err}') }
-		}
-	} else if typo_intensity > 0 {
-		if mode == 'encrypt' {
-			if message == '' { println('Error: Message required (-m)'); return }
-			if text_input == '' { println('Error: Cover text required (-t)'); return }
-			encrypt_text_stego(message, text_input, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite, transpose) or { println('Encryption failed: ${err}') }
-		} else {
-			if text_input == '' { println('Error: Carrier text required (-t)'); return }
-			decrypt_text_stego(text_input, ref_text, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite, transpose) or { println('Decryption failed: ${err}') }
+			locktime_encrypt_flow(file_path, out_path, duration, password, seed_key1, seed_key2, mem, iter, threads, prime_bits) or {
+				println('[-] Encryption Error: ${err}')
+			}
+		} else if mode == 'decrypt' {
+			locktime_decrypt_flow(file_path, out_path, password, seed_key1, seed_key2) or {
+				println('[-] Decryption Error: ${err}')
+			}
 		}
 	} else {
-		println('Error: You must provide either --formats (for Number Mode) or --typo-intensity (for Text Mode).')
-		print_help()
+		for i := 2; i < args.len; i++ {
+			arg := args[i]
+			match arg {
+				'-m', '--message' { if i + 1 < args.len { message = args[i + 1]; i++ } }
+				'-t', '--text' { if i + 1 < args.len { text_input = args[i + 1]; i++ } }
+				'-r', '--ref' { if i + 1 < args.len { ref_text = args[i + 1]; i++ } }
+				'-p', '--pass' { if i + 1 < args.len { password = args[i + 1]; i++ } }
+				'-s', '--seed' { if i + 1 < args.len { seed_val = args[i + 1].u64(); i++ } }
+				'-f', '--formats' { if i + 1 < args.len { raw_formats = args[i + 1]; i++ } }
+				'-ti', '--typo-intensity' { if i + 1 < args.len { typo_intensity = args[i + 1].int(); i++ } }
+				'-tc', '--typo-chars' { if i + 1 < args.len { typo_chars = args[i + 1]; i++ } }
+				'-km', '--key-map' { if i + 1 < args.len { key_map = args[i + 1]; i++ } }
+				'-q', '--qwerty' { use_qwerty = true }
+				'-o', '--overwrite' { overwrite = true }
+				'-tr', '--transpose' { transpose = true }
+				'-map', '--mapping' { if i + 1 < args.len { mapping_str = args[i + 1]; i++ } }
+				'-d', '--deobfuscate' { deobfuscate = true }
+				'-ni', '--noise-intensity' { if i + 1 < args.len { noise_intensity = args[i + 1].int(); i++ } }
+				'-nc', '--noise-chars' { if i + 1 < args.len { noise_chars_str = args[i + 1]; i++ } }
+				else {}
+			}
+		}
+
+		if mode == 'obfuscate' {
+			if text_input == '' {
+				println('Error: Text is required (-t or --text)')
+				return
+			}
+			if mapping_str == '' {
+				println('Error: Mapping string is required (-map or --mapping)')
+				return
+			}
+			m := parse_mapping(mapping_str)
+			noise_chars := get_noise_chars(noise_chars_str)
+
+			if deobfuscate {
+				result := apply_deobfuscation(text_input, m, noise_chars)
+				println('=== DE-OBFUSCATED TEXT ===\n' + result)
+			} else {
+				result := apply_obfuscation(text_input, m, noise_intensity, noise_chars, seed_val)
+				println('=== OBFUSCATED TEXT ===\n' + result)
+			}
+			return
+		}
+
+		if password == '' {
+			println('Error: Password is required (-p or --pass)')
+			return
+		}
+
+		if raw_formats != '' {
+			formats := parse_formats(raw_formats) or {
+				println('Format parse error: ${err}')
+				return
+			}
+			if mode == 'encrypt' {
+				if message == '' { println('Error: Message required (-m)'); return }
+				encrypt_number_flow(message, password, seed_val, formats) or { println('Encryption failed: ${err}') }
+			} else {
+				if text_input == '' { println('Error: Carrier text required (-t)'); return }
+				decrypt_number_flow(text_input, password, seed_val, formats) or { println('Decryption failed: ${err}') }
+			}
+		} else if typo_intensity > 0 {
+			if mode == 'encrypt' {
+				if message == '' { println('Error: Message required (-m)'); return }
+				if text_input == '' { println('Error: Cover text required (-t)'); return }
+				encrypt_text_stego(message, text_input, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite, transpose) or { println('Encryption failed: ${err}') }
+			} else {
+				if text_input == '' { println('Error: Carrier text required (-t)'); return }
+				decrypt_text_stego(text_input, ref_text, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite, transpose) or { println('Decryption failed: ${err}') }
+			}
+		} else {
+			println('Error: You must provide either --formats (for Number Mode) or --typo-intensity (for Text Mode).')
+			print_help()
+		}
 	}
 }
