@@ -1004,12 +1004,12 @@ fn derive_seed1(seed_str string, file_salt []u8, pbkdf2_iter_val int) ![]u8 {
 	return derived.clone()
 }
 
-fn derive_seed2(seed_str string, w_str string) ![]u8 {
-	derived := pbkdf2.key(seed_str.bytes(), w_str.bytes(), 1000, 64, sha512.new())!
+fn derive_seed2(seed_str string, w_str string, iter int) ![]u8 {
+	derived := pbkdf2.key(seed_str.bytes(), w_str.bytes(), iter, 64, sha512.new())!
 	return derived.clone()
 }
 
-fn generate_dynamic_dummy_params(password string, file_salt []u8, bits int) (big.Integer, big.Integer) {
+fn generate_dynamic_dummy_params(password string, file_salt []u8, bits int) big.Integer {
 	mut hasher := sha512.new()
 	hasher.write(password.bytes()) or {}
 	hasher.write(file_salt) or {}
@@ -1023,17 +1023,11 @@ fn generate_dynamic_dummy_params(password string, file_salt []u8, bits int) (big
 	bytes[0] |= 0x80
 	bytes[bytes.len - 1] |= 0x01
 	
-	n_dummy := big.integer_from_radix(bytes.hex(), 16) or { big.integer_from_int(3) }
-	
-	a_val := u32(rng.next_u32() % 1000) + 2
-	a_dummy := big.integer_from_int(int(a_val))
-	
-	return n_dummy, a_dummy
+	return big.integer_from_radix(bytes.hex(), 16) or { big.integer_from_int(3) }
 }
 
 struct VdfParams {
 	n big.Integer
-	a big.Integer
 	t u64
 }
 
@@ -1046,31 +1040,25 @@ struct DecryptedHeader {
 	proof []big.Integer
 }
 
-fn serialize_vdf_params(n big.Integer, a big.Integer, t u64) []u8 {
+fn serialize_vdf_params(n big.Integer, t u64) []u8 {
 	mut b := []u8{}
 	n_bytes := n.str().bytes()
-	a_bytes := a.str().bytes()
 	write_u16(mut b, u16(n_bytes.len))
-	write_u16(mut b, u16(a_bytes.len))
 	write_u64(mut b, t)
 	for byte in n_bytes { b << byte }
-	for byte in a_bytes { b << byte }
 	return b
 }
 
 fn deserialize_vdf_params(b []u8) !VdfParams {
-	if b.len < 12 { return error('Malformed VDF params size') }
+	if b.len < 10 { return error('Malformed VDF params size') }
 	n_len := read_u16(b, 0)
-	a_len := read_u16(b, 2)
-	t := read_u64(b, 4)
-	if int(n_len) > b.len - 12 || int(a_len) > b.len - 12 - int(n_len) {
+	t := read_u64(b, 2)
+	if int(n_len) > b.len - 10 {
 		return error('Malformed VDF params boundaries')
 	}
-	n_str := b[12 .. 12 + int(n_len)].bytestr()
-	a_str := b[12 + int(n_len) .. 12 + int(n_len) + int(a_len)].bytestr()
+	n_str := b[10 .. 10 + int(n_len)].bytestr()
 	n := big.integer_from_string(n_str)!
-	a := big.integer_from_string(a_str)!
-	return VdfParams{ n: n, a: a, t: t }
+	return VdfParams{ n: n, t: t }
 }
 
 fn serialize_header(salt []u8, iter u32, mem u32, threads u8, cipher_len u32, proof []big.Integer) []u8 {
@@ -1171,7 +1159,16 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	t_big := big.integer_from_u64(t_val)
 	println('[+] Calculated squarings (t): ${t_val} operations for ${duration_sec} seconds lock')
 
-	a := big.integer_from_int(2)
+	mut a_hash := sha512.new()
+	a_hash.write(password.bytes()) or {}
+	a_hash.write(file_salt) or {}
+	a_bytes := a_hash.sum([]u8{})
+	mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
+	a = a % n
+	if a < big.integer_from_int(2) {
+		a = big.integer_from_int(2)
+	}
+
 	e := big.integer_from_int(2).big_mod_pow(t_big, phi_n)!
 	w_trapdoor := a.big_mod_pow(e, n)!
 
@@ -1202,9 +1199,9 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
 
 	println('[*] Deriving independent Seed 2 (Payload Locator) bound to VDF Solution...')
-	seed_bytes2 := derive_seed2(seed2_str, w_trapdoor.str())!
+	seed_bytes2 := derive_seed2(seed2_str, w_trapdoor.str(), pbkdf2_iter)!
 	
-	header_key_iv := pbkdf2.key(password.bytes(), w_trapdoor.str().bytes(), 1000, 48, sha512.new())!
+	header_key_iv := pbkdf2.key(password.bytes(), w_trapdoor.str().bytes(), pbkdf2_iter, 48, sha512.new())!
 	header_key := header_key_iv[0..32].hex()
 	header_iv := header_key_iv[32..48].hex()
 
@@ -1222,7 +1219,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 
 	cipher_bytes := os.read_bytes(tmp_cipher_file)!
 
-	vdf_params := serialize_vdf_params(n, a, t_val)
+	vdf_params := serialize_vdf_params(n, t_val)
 	header_raw := serialize_header(salt, iter, mem, threads, u32(cipher_bytes.len), proof)
 	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
 
@@ -1356,22 +1353,28 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		}
 	}
 
-	n_dummy, a_dummy := generate_dynamic_dummy_params(password, file_salt, 1024)
+	n_dummy := generate_dynamic_dummy_params(password, file_salt, 1024)
 	vdf_p := deserialize_vdf_params(vdf_bytes) or {
-		VdfParams{ n: n_dummy, a: a_dummy, t: u64(100000) }
+		VdfParams{ n: n_dummy, t: u64(100000) }
 	}
 	mut n := vdf_p.n
-	mut a := vdf_p.a
 	mut t_val := vdf_p.t
 
 	if n <= big.integer_from_int(2) {
 		n = n_dummy
 	}
-	if a <= big.integer_from_int(1) || a >= n {
-		a = a_dummy
-	}
 	if t_val < 1 || t_val > 50000000 {
 		t_val = 100000
+	}
+
+	mut a_hash := sha512.new()
+	a_hash.write(password.bytes()) or {}
+	a_hash.write(file_salt) or {}
+	a_bytes := a_hash.sum([]u8{})
+	mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
+	a = a % n
+	if a < big.integer_from_int(2) {
+		a = big.integer_from_int(2)
 	}
 
 	println('[*] Resolving time-lock puzzle sequentially (t = ${t_val}). Please wait...')
@@ -1388,7 +1391,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	}
 	println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
 	
-	header_key_iv := pbkdf2.key(password.bytes(), x.str().bytes(), 1000, 48, sha512.new()) or { []u8{len: 48} }
+	header_key_iv := pbkdf2.key(password.bytes(), x.str().bytes(), pbkdf2_iter, 48, sha512.new()) or { []u8{len: 48} }
 	header_key := header_key_iv[0..32].hex()
 	header_iv := header_key_iv[32..48].hex()
 
@@ -1441,7 +1444,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	_ = pietrzak_verify(a, x, t_val, header.proof, n) or { false }
 	println('[+] Mathematical verification of the puzzle proof: COMPLETE')
 
-	seed_bytes2 := derive_seed2(seed2_str, x.str()) or { []u8{len: 64} }
+	seed_bytes2 := derive_seed2(seed2_str, x.str(), pbkdf2_iter) or { []u8{len: 64} }
 	
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
 	for i := remaining_indices.len - 1; i > 0; i-- {
