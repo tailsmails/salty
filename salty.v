@@ -10,10 +10,10 @@ import time
 
 struct SecurePRNG {
 mut:
-	seed []u8
+	seed    []u8
 	counter u64
-	buffer []u8
-	idx int
+	buffer  []u8
+	idx     int
 }
 
 fn (mut rng SecurePRNG) next_u8() u8 {
@@ -43,6 +43,21 @@ fn (mut rng SecurePRNG) next_u32() u32 {
 fn (mut rng SecurePRNG) intn(n int) int {
 	if n <= 0 { return 0 }
 	return int(rng.next_u32() % u32(n))
+}
+
+fn new_secure_prng_from_u64(seed u64) SecurePRNG {
+	mut b := []u8{len: 8}
+	mut temp := seed
+	for i in 0 .. 8 {
+		b[7 - i] = u8(temp & 0xFF)
+		temp >>= 8
+	}
+	return SecurePRNG{
+		seed: b
+		counter: 0
+		buffer: []u8{}
+		idx: 0
+	}
 }
 
 fn secure_random_bytes(size int) ![]u8 {
@@ -77,21 +92,6 @@ fn new_secure_prng() !SecurePRNG {
 		buffer: []u8{}
 		idx: 0
 	}
-}
-
-struct LCG {
-mut:
-	state u64
-}
-
-fn (mut rng LCG) next() u32 {
-	rng.state = rng.state * u64(6364136223846793005) + u64(1442695040888963407)
-	return u32(rng.state >> 32)
-}
-
-fn (mut rng LCG) intn(n int) int {
-	if n <= 0 { return 0 }
-	return int(rng.next() % u32(n))
 }
 
 struct Format {
@@ -131,7 +131,7 @@ fn parse_formats(raw string) ![]Format {
 fn get_shuffled_indices(len int, seed u64) []int {
 	mut indices := []int{len: len}
 	for i in 0 .. len { indices[i] = i }
-	mut rng := LCG{state: seed}
+	mut rng := new_secure_prng_from_u64(seed)
 	for i := len - 1; i > 0; i-- {
 		j := rng.intn(i + 1)
 		indices[i], indices[j] = indices[j], indices[i]
@@ -328,7 +328,7 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed u
 		for r in key_map_str.replace(',', '').trim_space().runes() { key_map_runes << r }
 	}
 
-	mut rng := LCG{state: seed}
+	mut rng := new_secure_prng_from_u64(seed)
 	runes := cover_text.runes()
 	mut modified_text := []rune{}
 	
@@ -406,7 +406,7 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed u
 }
 
 fn decrypt_text_stego(modified_text string, ref_text string, password string, seed u64, intensity int, typo_chars_str string, key_map_str string, use_qwerty bool, overwrite bool, transpose bool) ! {
-	mut rng := LCG{state: seed}
+	mut rng := new_secure_prng_from_u64(seed)
 	modified_runes := modified_text.runes()
 	
 	mut spots := []DecryptSpot{}
@@ -507,7 +507,7 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 		}
 		fallback_chars_ins.sort()
 
-		mut rng_ins := LCG{state: seed}
+		mut rng_ins := new_secure_prng_from_u64(seed)
 		mut original_idx := 0
 		mut carrier_idx := 0
 		mut spot_idx := 0
@@ -580,7 +580,7 @@ fn encrypt_number_flow(message string, password string, seed u64, formats []Form
 		mut chunk_data := dec_str[cursor .. cursor + size]
 		if is_last && chunk_data.len < fmt.payload_len {
 			needed := fmt.payload_len - chunk_data.len
-			mut rng := LCG{state: seed + 999}
+			mut rng := new_secure_prng_from_u64(seed + 999)
 			for _ in 0 .. needed { chunk_data += rng.intn(10).str() }
 		}
 
@@ -680,12 +680,12 @@ fn get_noise_chars(custom_str string) []rune {
 			return runes
 		}
 	}
-	noise_str := '*~_•°†‡▲▼◆◇■□◀▶♠♥♦♣★☆✦✧✪✿ '
+	noise_str := '*~_•°†‡▲▼◆◇■□◀▶♠♥♦♣★☆✦✧✪✿'
 	return noise_str.runes()
 }
 
 fn apply_obfuscation(text string, m map[string][]string, noise_intensity int, noise_chars []rune, seed u64) string {
-	mut rng := LCG{state: seed}
+	mut rng := new_secure_prng_from_u64(seed)
 	runes := text.runes()
 	mut result := []rune{}
 
@@ -855,7 +855,7 @@ fn is_prime_mr(n big.Integer, k int) !bool {
 		mut composite := true
 		for _ in 0 .. s - 1 {
 			x = (x * x) % n
-			if x =n_minus_1 {
+			if x == n_minus_1 {
 				composite = false
 				break
 			}
@@ -1041,18 +1041,19 @@ fn generate_dynamic_dummy_params(password string, file_salt []u8, bits int) big.
 }
 
 struct VdfParams {
-	n big.Integer
-	t u64
+	n     big.Integer
+	t     u64
 	is_pq bool
 }
 
 struct DecryptedHeader {
-	salt []u8
-	iter u32
-	mem u32
-	threads u8
-	cipher_len u32
-	proof []big.Integer
+	salt           []u8
+	iter           u32
+	mem            u32
+	threads        u8
+	lwe_dim        u16
+	cipher_len     u32
+	proof          []big.Integer
 	lwe_ciphertext []u8
 }
 
@@ -1079,12 +1080,13 @@ fn deserialize_vdf_params(b []u8) !VdfParams {
 	return VdfParams{ n: n, t: t, is_pq: is_pq }
 }
 
-fn serialize_header(salt []u8, iter u32, mem u32, threads u8, cipher_len u32, proof []big.Integer, lwe_ciphertext []u8) []u8 {
+fn serialize_header(salt []u8, iter u32, mem u32, threads u8, lwe_dim u16, cipher_len u32, proof []big.Integer, lwe_ciphertext []u8) []u8 {
 	mut b := []u8{}
 	for byte in salt { b << byte }
 	write_u32(mut b, iter)
 	write_u32(mut b, mem)
 	b << threads
+	write_u16(mut b, lwe_dim)
 	write_u32(mut b, cipher_len)
 	write_u32(mut b, u32(lwe_ciphertext.len))
 	for byte in lwe_ciphertext { b << byte }
@@ -1093,24 +1095,25 @@ fn serialize_header(salt []u8, iter u32, mem u32, threads u8, cipher_len u32, pr
 }
 
 fn deserialize_header(b []u8) !DecryptedHeader {
-	if b.len < 33 { return error('Malformed header size') }
+	if b.len < 35 { return error('Malformed header size') }
 	mut salt := []u8{len: 16}
 	for i in 0 .. 16 { salt[i] = b[i] }
 	iter := read_u32(b, 16)
 	mem := read_u32(b, 20)
 	threads := b[24]
-	cipher_len := read_u32(b, 25)
-	lwe_len := read_u32(b, 29)
+	lwe_dim := read_u16(b, 25)
+	cipher_len := read_u32(b, 27)
+	lwe_len := read_u32(b, 31)
 	
-	if int(lwe_len) < 0 || b.len < 33 + int(lwe_len) {
+	if int(lwe_len) < 0 || b.len < 35 + int(lwe_len) {
 		return error('Malformed header LWE size')
 	}
 	mut lwe_ciphertext := []u8{len: int(lwe_len)}
 	for i in 0 .. int(lwe_len) {
-		lwe_ciphertext[i] = b[33 + i]
+		lwe_ciphertext[i] = b[35 + i]
 	}
 	
-	mut proof_offset := ProofIndex{ val: 33 + int(lwe_len) }
+	mut proof_offset := ProofIndex{ val: 35 + int(lwe_len) }
 	proof := deserialize_proof(b, mut proof_offset) or {
 		return error('Malformed proof in header: ' + err.msg())
 	}
@@ -1119,6 +1122,7 @@ fn deserialize_header(b []u8) !DecryptedHeader {
 		iter: iter
 		mem: mem
 		threads: threads
+		lwe_dim: lwe_dim
 		cipher_len: cipher_len
 		proof: proof
 		lwe_ciphertext: lwe_ciphertext
@@ -1161,17 +1165,21 @@ fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) 
 	return os.read_bytes(tmp_out)!
 }
 
-fn lwe_encrypt(data []u8, secret []u8, mut rng SecurePRNG) []u8 {
-	mut cipher := []u8{cap: data.len * 8 * 33}
+fn lwe_encrypt(data []u8, base_secret []u8, dim int, mut rng SecurePRNG) []u8 {
+	mut s_rng := SecurePRNG{seed: base_secret}
+	mut secret := []u8{len: dim}
+	for i in 0 .. dim { secret[i] = s_rng.next_u8() }
+
+	mut cipher := []u8{cap: data.len * 8 * (dim + 1)}
 	for byte in data {
 		for bit_idx in 0 .. 8 {
 			bit := (byte >> bit_idx) & 1
-			mut a := []u8{len: 32}
-			for i in 0 .. 32 {
+			mut a := []u8{len: dim}
+			for i in 0 .. dim {
 				a[i] = rng.next_u8()
 			}
 			mut dot := u8(0)
-			for i in 0 .. 32 {
+			for i in 0 .. dim {
 				dot += a[i] * secret[i]
 			}
 			err := int(rng.next_u8() % 17) - 8
@@ -1188,23 +1196,28 @@ fn lwe_encrypt(data []u8, secret []u8, mut rng SecurePRNG) []u8 {
 	return cipher
 }
 
-fn lwe_decrypt(cipher []u8, secret []u8, data_len int) ![]u8 {
-	if cipher.len < data_len * 8 * 33 {
+fn lwe_decrypt(cipher []u8, base_secret []u8, data_len int, dim int) ![]u8 {
+	if cipher.len < data_len * 8 * (dim + 1) {
 		return error('Malformed LWE ciphertext length')
 	}
+	
+	mut s_rng := SecurePRNG{seed: base_secret}
+	mut secret := []u8{len: dim}
+	for i in 0 .. dim { secret[i] = s_rng.next_u8() }
+
 	mut data := []u8{cap: data_len}
 	mut offset := 0
 	for _ in 0 .. data_len {
 		mut byte := u8(0)
 		for bit_idx in 0 .. 8 {
-			mut a := []u8{len: 32}
-			for i in 0 .. 32 {
+			mut a := []u8{len: dim}
+			for i in 0 .. dim {
 				a[i] = cipher[offset + i]
 			}
-			c := cipher[offset + 32]
-			offset += 33
+			c := cipher[offset + dim]
+			offset += dim + 1
 			mut dot := u8(0)
-			for i in 0 .. 32 {
+			for i in 0 .. dim {
 				dot += a[i] * secret[i]
 			}
 			diff := c - dot
@@ -1221,7 +1234,7 @@ fn lwe_decrypt(cipher []u8, secret []u8, data_len int) ![]u8 {
 	return data
 }
 
-fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1_str string, seed2_str string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool, is_pq bool) ! {
+fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1_str string, seed2_str string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool, is_pq bool, lwe_dim u16) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 	
 	if prime_bits < 256 || prime_bits > 4096 {
@@ -1328,7 +1341,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		mut session_key_iv := []u8{cap: 48}
 		for byte in session_key { session_key_iv << byte }
 		for byte in session_iv { session_key_iv << byte }
-		lwe_ciphertext = lwe_encrypt(session_key_iv, s, mut rng)
+		lwe_ciphertext = lwe_encrypt(session_key_iv, s, int(lwe_dim), mut rng)
 	} else {
 		salt = secure_random_bytes(16)!
 		mut argon_key := argon2.d_key(password.bytes(), salt, iter, mem, threads, 48)!
@@ -1348,7 +1361,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	}
 
 	vdf_params := serialize_vdf_params(n, t_val, is_pq)
-	header_raw := serialize_header(salt, iter_val, mem_val, threads_val, u32(cipher_bytes.len), proof, lwe_ciphertext)
+	header_raw := serialize_header(salt, iter_val, mem_val, threads_val, lwe_dim, u32(cipher_bytes.len), proof, lwe_ciphertext)
 	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
 
 	mut meta := []u8{}
@@ -1550,6 +1563,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 			iter: u32(3)
 			mem: u32(65536)
 			threads: u8(4)
+			lwe_dim: u16(512)
 			cipher_len: u32(total_len - meta_total_len)
 			proof: []big.Integer{}
 			lwe_ciphertext: []u8{}
@@ -1576,7 +1590,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 
 	if vdf_p.is_pq {
 		s := sha512.sum512(x_bytes)[0..32].clone()
-		dec_key_iv := lwe_decrypt(header.lwe_ciphertext, s, 48) or {
+		dec_key_iv := lwe_decrypt(header.lwe_ciphertext, s, 48, int(header.lwe_dim)) or {
 			return error('Failed to decrypt LWE key: ' + err.msg())
 		}
 		session_key = dec_key_iv[0..32].clone()
@@ -1672,6 +1686,7 @@ fn print_help() {
 	println('  -s2, --seed2 <str>         Independent password/seed to map the payload blocks')
 	println('  -sh, --shred               Securely shred the original input file after successful execution')
 	println('  --classic                  Enable classical RSW96 VDF mode (Default is Post-Quantum SHA-512 + LWE-KEM)')
+	println('  --lwe-dim <size>           Lattice dimension for PQ KEM (Default: 512, Min: 256)')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
 	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
 	println('  --threads <count>          Argon2 Threads (Default: 4)')
@@ -1802,7 +1817,7 @@ fn main() {
 
 	mut is_locktime := false
 	for a in args {
-		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s1', '--seed1', '-s2', '--seed2', '--classic'] {
+		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s1', '--seed1', '-s2', '--seed2', '--classic', '--lwe-dim'] {
 			is_locktime = true
 			break
 		}
@@ -1823,6 +1838,7 @@ fn main() {
 	mut pbkdf2_iter := 200000
 	mut shred_orig := false
 	mut is_pq := true
+	mut lwe_dim := u16(512)
 
 	mut message := ''
 	mut text_input := ''
@@ -1857,6 +1873,7 @@ fn main() {
 				'--threads' { if i + 1 < args.len { threads = u8(args[i+1].int()); i++ } }
 				'--prime' { if i + 1 < args.len { prime_bits = args[i+1].int(); i++ } }
 				'--pbkdf2-iter' { if i + 1 < args.len { pbkdf2_iter = args[i+1].int(); i++ } }
+				'--lwe-dim' { if i + 1 < args.len { lwe_dim = u16(args[i+1].int()); i++ } }
 				'-sh', '--shred' { shred_orig = true }
 				'--classic' { is_pq = false }
 				else {}
@@ -1874,7 +1891,11 @@ fn main() {
 		}
 
 		if mode == 'encrypt' {
-			locktime_encrypt_flow(file_path, out_path, duration, password, seed1_str, seed2_str, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig, is_pq) or {
+			if is_pq && lwe_dim < 256 {
+				println('Error: LWE dimension must be at least 256 for security.')
+				return
+			}
+			locktime_encrypt_flow(file_path, out_path, duration, password, seed1_str, seed2_str, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig, is_pq, lwe_dim) or {
 				println('[-] Encryption Error: ${err}')
 			}
 		} else if mode == 'decrypt' {
