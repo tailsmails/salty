@@ -5,8 +5,9 @@ Salty is a lightweight, high-performance command-line utility written in V for s
 ## Features
 
 ### 1. Locktime Engine (Sequential Time-Lock Cryptography)
-- **RSW96 & Pietrzak VDF with Password-Derived Base**: Secures files by requiring sequential modular squarings ($x_{i+1} = x_i^2 \pmod N$) that cannot be parallelized. Crucially, the starting base $a$ is dynamically derived on the fly from the Master Password and the file salt ($a = \text{Hash}(\text{MasterPassword} + \text{salt}) \pmod N$) and is *never* stored in the file's public metadata.
-- **Offline Brute-Force Immunity (Asymmetric Proof-of-Work)**: Because the VDF base $a$ is cryptographically bound to the password, an attacker cannot solve the puzzle once and then rapidly brute-force passwords offline. Testing any password guess forces the attacker to solve the $T$-second sequential VDF all over again, escalating the total brute-force cost from $T + N \times (\text{Fast KDF})$ to $N \times T$ (where $N$ is the number of guesses).
+- **Post-Quantum Default VDF**: By default, Salty utilizes a sequential SHA-512 Hash-Chain to enforce a rigorous time-lock delay. This design is completely immune to Grover's and Shor's algorithms, preventing quantum computers from bypassing the sequential delay.
+- **Lattice-Based Key Encapsulation (LWE-KEM)**: Secures the 256-bit symmetric session key using a lightweight Ring-LWE style Learning with Errors (LWE) post-quantum scheme. The LWE secret is derived dynamically from the solved VDF, adding quantum-resistant hardness to the key wrapping.
+- **Classical RSW96 Fallback (`--classic`)**: Optional fallback mode using sequential modular squarings ($x_{i+1} = x_i^2 \pmod N$) with Pietrzak VDF verification proof. The starting base $a$ is dynamically derived from the Master Password and the file salt ($a = \text{Hash}(\text{MasterPassword} + \text{salt}) \pmod N$) to neutralize offline parallelized brute-force attacks.
 - **Triple-Key Security Model (Oracle-Resistance)**: 
     - **Master Password**: Used for ChaCha20/Argon2id encryption.
     - **Seed 1 (`-s1`)**: Independent locator key used to shuffle and hide the Time-Lock puzzle blocks.
@@ -42,12 +43,17 @@ pkg update -y && pkg install -y git clang make openssl zstd && if ! command -v v
 ## Usage
 
 ### 1. Locktime Mode (Time-Lock Encryption)
-**Encryption (10s lock, 1024-bit Modulus, Shred Original):**
+**Encryption (PQ default, 10s lock, Shred Original):**
 ```bash
 ./salty encrypt -f secret.txt -o locked_file -t 10 -p "MasterPass" -s1 "Key1" -s2 "Key2" -sh
 ```
 
-**Decryption (Sequential Solving):**
+**Encryption in Classical Mode (reverts to RSW96/Pietrzak VDF, 1024-bit Modulus):**
+```bash
+./salty encrypt -f secret.txt -o locked_file -t 10 -p "MasterPass" -s1 "Key1" -s2 "Key2" --classic -sh
+```
+
+**Decryption (Sequential Solving - Automatically Detects PQ or Classical Mode):**
 ```bash
 ./salty decrypt -f locked_file -o restored.txt -p "MasterPass" -s1 "Key1" -s2 "Key2"
 ```
@@ -88,6 +94,7 @@ pkg update -y && pkg install -y git clang make openssl zstd && if ! command -v v
 | `-s2`| `--seed2`| **Payload Locator Key** | Locktime |
 | `-sh`| `--shred` | Securely wipe original file after success | Locktime |
 | `--prime`| — | Prime size (Default: 512, yields 1024-bit N) | Locktime |
+| `--classic`| — | Disable default PQ VDF mode (reverts to RSW96/Pietrzak VDF) | Locktime |
 | `-m` | `--message` | Secret data to be hidden | Salty |
 | `-t` | `--text` | Cover text or Text to obfuscate | Salty / Obf |
 | `-r` | `--ref` | Original Reference text (Required for -o/-tr) | Salty |
@@ -103,11 +110,13 @@ pkg update -y && pkg install -y git clang make openssl zstd && if ! command -v v
 
 ## Security Model
 **Salty** provides a defense-in-depth architecture:
-1. **Asymmetric Sequential Delay (VDF)**: Binding the puzzle base $a$ directly to the Master Password forces a mathematical wait-time of $T$ seconds *per password guess*, rendering offline dictionary and brute-force attacks computationally impractical.
-2. **Oracle Resistance**: Decoupling the physical file structure (`Seed 1`) from the Master Password prevents attackers from instantly validating guesses or even locating the encrypted metadata block.
-3. **Stretched Key Derivation**: Replaces low-iteration PBKDF2 layers with configurable high-entropy stretching (default: 200,000 rounds) to further secure the secondary key and seed derivation pipelines.
-4. **Forensic Erasure**: Zero-Disk Leakage and Active Zeroization ensure no plaintext or decrypted keys are leaked to the disk or left in memory for forensic recovery.
-5. **NLP Evasion**: Hides data in "human noise" (typos/visual twins) that AI filters cannot reliably tokenize or detect.
+1. **Asymmetric Sequential Delay (VDF)**: By default, using a SHA-512 Sequential Hash-Chain VDF forces a mathematical wait-time of $T$ seconds *per password guess* that cannot be bypassed by quantum computers or highly parallelized hardware, rendering offline dictionary attacks computationally impractical.
+2. **Post-Quantum Key Wrapping**: Secures the symmetric session key with a Learning with Errors (LWE) lattice-based key encapsulation mechanism, ensuring metadata confidentiality even under post-quantum scrutiny.
+3. **Oracle Resistance**: Decoupling the physical file structure (`Seed 1`) from the Master Password prevents attackers from instantly validating guesses or even locating the encrypted metadata block.
+4. **Stretched Key Derivation**: Replaces low-iteration PBKDF2 layers with configurable high-entropy stretching (default: 200,000 rounds) to further secure the secondary key and seed derivation pipelines.
+5. **Robust Bounds Checking**: The metadata deserialization parsers enforce strict size and boundary validation, ensuring graceful error reporting and immunity to memory allocation panics under wrong password or garbage inputs.
+6. **Forensic Erasure**: Zero-Disk Leakage and Active Zeroization ensure no plaintext or decrypted keys are leaked to the disk or left in memory for forensic recovery.
+7. **NLP Evasion**: Hides data in "human noise" (typos/visual twins) that AI filters cannot reliably tokenize or detect.
 
 ## License
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
