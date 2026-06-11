@@ -1139,8 +1139,17 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	offset += 4
 
 	meta_total_len := total_len / 2 - int(cipher_len)
-	if total_len < meta_total_len + int(cipher_len) {
-		return error('Extracted parameters exceed file boundary. Invalid Seed Key 1 or corrupted file.')
+	
+	if int(cipher_len) <= 0 || int(cipher_len) > total_len / 2 {
+		return error('Invalid Seed Key 1 or corrupted file.')
+	}
+
+	if meta_total_len <= 43 || meta_total_len >= total_len {
+		return error('Invalid Seed Key 1 or corrupted file.')
+	}
+
+	if int(n_len) + int(a_len) + int(ck_len) > meta_total_len - 43 {
+		return error('Invalid Seed Key 1 or corrupted file.')
 	}
 
 	mut var_meta := []u8{len: meta_total_len - 43}
