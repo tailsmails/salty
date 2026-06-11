@@ -5,12 +5,14 @@ Salty is a lightweight, high-performance command-line utility written in V for s
 ## Features
 
 ### 1. Locktime Engine (Sequential Time-Lock Cryptography)
-- **RSW96 & Pietrzak VDF**: Secures files by requiring sequential modular squarings ($x_{i+1} = x_i^2 \pmod N$) that cannot be parallelized.
+- **RSW96 & Pietrzak VDF with Password-Derived Base**: Secures files by requiring sequential modular squarings ($x_{i+1} = x_i^2 \pmod N$) that cannot be parallelized. Crucially, the starting base $a$ is dynamically derived on the fly from the Master Password and the file salt ($a = \text{Hash}(\text{MasterPassword} + \text{file\_salt}) \pmod N$) and is *never* stored in the file's public metadata.
+- **Offline Brute-Force Immunity (Asymmetric Proof-of-Work)**: Because the VDF base $a$ is cryptographically bound to the password, an attacker cannot solve the puzzle once and then rapidly brute-force passwords offline. Testing any password guess forces the attacker to solve the $T$-second sequential VDF all over again, escalating the total brute-force cost from $T + N \times (\text{Fast KDF})$ to $N \times T$ (where $N$ is the number of guesses).
 - **Triple-Key Security Model (Oracle-Resistance)**: 
     - **Master Password**: Used for ChaCha20/Argon2id encryption.
     - **Seed 1 (`-s1`)**: Independent locator key used to shuffle and hide the Time-Lock puzzle blocks.
     - **Seed 2 (`-s2`)**: Independent locator key used to map the encrypted payload.
     - *Why?* By separating the puzzle location (`Seed 1`) from the Master Password, even if an attacker guesses the password, they cannot instantly verify it. They are forced to solve the Time-Lock puzzle first, making brute-force mathematically impossible.
+- **Hardened Key Derivation**: The header encryption key and the secondary payload seed are strengthened using the user-configured stretching parameter (`pbkdf2_iter` which defaults to 200,000 rounds) instead of weak default iterations.
 - **Forensic Evasion & OpSec**:
     - **Zero-Disk-Leakage**: Decryption streams directly through OS pipes (`|`) between `openssl` and `zstd`. Plaintext never touches the disk.
     - **Secure Shredding (`-sh`)**: Built-in support to wipe original files using Linux `shred`, macOS `rm -P`, or a multi-pass zero-overwrite fallback.
@@ -101,10 +103,11 @@ pkg update -y && pkg install -y git clang make openssl zstd && if ! command -v v
 
 ## Security Model
 **Salty** provides a defense-in-depth architecture:
-1. **Physical Delay (VDF)**: Forces a mathematical wait-time that cannot be bypassed by high-end hardware.
-2. **Oracle Resistance**: Decoupling file structure from the Master Password prevents instant password validation.
-3. **Forensic Erasure**: Zero-Disk Leakage and Secure Shredding ensure no traces are left for recovery tools.
-4. **NLP Evasion**: Hides data in "human noise" (typos/visual twins) that AI filters cannot reliably tokenize or detect.
+1. **Asymmetric Sequential Delay (VDF)**: Binding the puzzle base $a$ directly to the Master Password forces a mathematical wait-time of $T$ seconds *per password guess*, rendering offline dictionary and brute-force attacks computationally impractical.
+2. **Oracle Resistance**: Decoupling the physical file structure (`Seed 1`) from the Master Password prevents attackers from instantly validating guesses or even locating the encrypted metadata block.
+3. **Stretched Key Derivation**: Replaces low-iteration PBKDF2 layers with configurable high-entropy stretching (default: 200,000 rounds) to further secure the secondary key and seed derivation pipelines.
+4. **Forensic Erasure**: Zero-Disk Leakage and Active Zeroization ensure no plaintext or decrypted keys are leaked to the disk or left in memory for forensic recovery.
+5. **NLP Evasion**: Hides data in "human noise" (typos/visual twins) that AI filters cannot reliably tokenize or detect.
 
 ## License
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
