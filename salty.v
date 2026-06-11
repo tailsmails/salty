@@ -54,7 +54,7 @@ fn secure_random_bytes(size int) ![]u8 {
 			mut total := 0
 			for total < size {
 				mut temp_buf := []u8{len: size - total}
-				n := f.read(mut temp_buf) or { return error('Failed to read /dev/urandom: ' + err.msg()) }
+				n := f.read(mut temp_buf) or { return error('Failed to read /dev/urandom: EOF reached') }
 				if n <= 0 {
 					return error('Failed to read from /dev/urandom: EOF reached')
 				}
@@ -855,7 +855,7 @@ fn is_prime_mr(n big.Integer, k int) !bool {
 		mut composite := true
 		for _ in 0 .. s - 1 {
 			x = (x * x) % n
-			if x == n_minus_1 {
+			if x =n_minus_1 {
 				composite = false
 				break
 			}
@@ -913,6 +913,20 @@ fn run_calibration(n big.Integer) u64 {
 	
 	mut steps_per_ms := f64(test_steps) / f64(if duration == 0 { 1 } else { duration })
 	println('[+] CPU speed: ${steps_per_ms:.2f} squarings/ms')
+	return u64(steps_per_ms)
+}
+
+fn run_pq_calibration() u64 {
+	println('[*] Calibrating single-thread CPU performance for Post-Quantum SHA-512 VDF...')
+	mut data := []u8{len: 64}
+	test_steps := u64(100000)
+	start := time.now()
+	for _ in 0 .. test_steps {
+		data = sha512.sum512(data)
+	}
+	duration := time.since(start).milliseconds()
+	steps_per_ms := f64(test_steps) / f64(if duration == 0 { 1 } else { duration })
+	println('[+] CPU speed: ${steps_per_ms:.2f} hashes/ms')
 	return u64(steps_per_ms)
 }
 
@@ -1029,6 +1043,7 @@ fn generate_dynamic_dummy_params(password string, file_salt []u8, bits int) big.
 struct VdfParams {
 	n big.Integer
 	t u64
+	is_pq bool
 }
 
 struct DecryptedHeader {
@@ -1038,51 +1053,67 @@ struct DecryptedHeader {
 	threads u8
 	cipher_len u32
 	proof []big.Integer
+	lwe_ciphertext []u8
 }
 
-fn serialize_vdf_params(n big.Integer, t u64) []u8 {
+fn serialize_vdf_params(n big.Integer, t u64, is_pq bool) []u8 {
 	mut b := []u8{}
 	n_bytes := n.str().bytes()
 	write_u16(mut b, u16(n_bytes.len))
 	write_u64(mut b, t)
+	b << u8(if is_pq { 1 } else { 0 })
 	for byte in n_bytes { b << byte }
 	return b
 }
 
 fn deserialize_vdf_params(b []u8) !VdfParams {
-	if b.len < 10 { return error('Malformed VDF params size') }
+	if b.len < 11 { return error('Malformed VDF params size') }
 	n_len := read_u16(b, 0)
 	t := read_u64(b, 2)
-	if int(n_len) > b.len - 10 {
+	is_pq := b[10] == 1
+	if int(n_len) > b.len - 11 {
 		return error('Malformed VDF params boundaries')
 	}
-	n_str := b[10 .. 10 + int(n_len)].bytestr()
+	n_str := b[11 .. 11 + int(n_len)].bytestr()
 	n := big.integer_from_string(n_str)!
-	return VdfParams{ n: n, t: t }
+	return VdfParams{ n: n, t: t, is_pq: is_pq }
 }
 
-fn serialize_header(salt []u8, iter u32, mem u32, threads u8, cipher_len u32, proof []big.Integer) []u8 {
+fn serialize_header(salt []u8, iter u32, mem u32, threads u8, cipher_len u32, proof []big.Integer, lwe_ciphertext []u8) []u8 {
 	mut b := []u8{}
 	for byte in salt { b << byte }
 	write_u32(mut b, iter)
 	write_u32(mut b, mem)
 	b << threads
 	write_u32(mut b, cipher_len)
+	write_u32(mut b, u32(lwe_ciphertext.len))
+	for byte in lwe_ciphertext { b << byte }
 	serialize_proof(mut b, proof)
 	return b
 }
 
 fn deserialize_header(b []u8) !DecryptedHeader {
-	if b.len < 29 { return error('Malformed header size') }
+	if b.len < 33 { return error('Malformed header size') }
 	mut salt := []u8{len: 16}
 	for i in 0 .. 16 { salt[i] = b[i] }
 	iter := read_u32(b, 16)
 	mem := read_u32(b, 20)
 	threads := b[24]
 	cipher_len := read_u32(b, 25)
+	lwe_len := read_u32(b, 29)
 	
-	mut proof_offset := ProofIndex{ val: 29 }
-	proof := deserialize_proof(b, mut proof_offset)!
+	if int(lwe_len) < 0 || b.len < 33 + int(lwe_len) {
+		return error('Malformed header LWE size')
+	}
+	mut lwe_ciphertext := []u8{len: int(lwe_len)}
+	for i in 0 .. int(lwe_len) {
+		lwe_ciphertext[i] = b[33 + i]
+	}
+	
+	mut proof_offset := ProofIndex{ val: 33 + int(lwe_len) }
+	proof := deserialize_proof(b, mut proof_offset) or {
+		return error('Malformed proof in header: ' + err.msg())
+	}
 	return DecryptedHeader{
 		salt: salt
 		iter: iter
@@ -1090,6 +1121,7 @@ fn deserialize_header(b []u8) !DecryptedHeader {
 		threads: threads
 		cipher_len: cipher_len
 		proof: proof
+		lwe_ciphertext: lwe_ciphertext
 	}
 }
 
@@ -1129,7 +1161,67 @@ fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) 
 	return os.read_bytes(tmp_out)!
 }
 
-fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1_str string, seed2_str string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool) ! {
+fn lwe_encrypt(data []u8, secret []u8, mut rng SecurePRNG) []u8 {
+	mut cipher := []u8{cap: data.len * 8 * 33}
+	for byte in data {
+		for bit_idx in 0 .. 8 {
+			bit := (byte >> bit_idx) & 1
+			mut a := []u8{len: 32}
+			for i in 0 .. 32 {
+				a[i] = rng.next_u8()
+			}
+			mut dot := u8(0)
+			for i in 0 .. 32 {
+				dot += a[i] * secret[i]
+			}
+			err := int(rng.next_u8() % 17) - 8
+			mut c := dot + (bit * 128)
+			if err >= 0 {
+				c += u8(err)
+			} else {
+				c -= u8(-err)
+			}
+			for val in a { cipher << val }
+			cipher << c
+		}
+	}
+	return cipher
+}
+
+fn lwe_decrypt(cipher []u8, secret []u8, data_len int) ![]u8 {
+	if cipher.len < data_len * 8 * 33 {
+		return error('Malformed LWE ciphertext length')
+	}
+	mut data := []u8{cap: data_len}
+	mut offset := 0
+	for _ in 0 .. data_len {
+		mut byte := u8(0)
+		for bit_idx in 0 .. 8 {
+			mut a := []u8{len: 32}
+			for i in 0 .. 32 {
+				a[i] = cipher[offset + i]
+			}
+			c := cipher[offset + 32]
+			offset += 33
+			mut dot := u8(0)
+			for i in 0 .. 32 {
+				dot += a[i] * secret[i]
+			}
+			diff := c - dot
+			mut bit := u8(0)
+			mut diff_from_128 := int(diff) - 128
+			if diff_from_128 < 0 { diff_from_128 = -diff_from_128 }
+			if diff_from_128 < 64 {
+				bit = 1
+			}
+			byte |= (bit << bit_idx)
+		}
+		data << byte
+	}
+	return data
+}
+
+fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1_str string, seed2_str string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool, is_pq bool) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 	
 	if prime_bits < 256 || prime_bits > 4096 {
@@ -1138,70 +1230,76 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	
 	file_salt := secure_random_bytes(32)!
 
-	println('[*] Generating dynamic prime \$p (${prime_bits} bits)...')
-	p := generate_prime(prime_bits)!
-	println('[*] Generating dynamic prime \$q (${prime_bits} bits)...')
-	q := generate_prime(prime_bits)!
-	
-	n := p * q
-	one := big.integer_from_int(1)
-	phi_n := (p - one) * (q - one)
-
-	steps_per_ms := run_calibration(n)
-	mut t_val := duration_sec * steps_per_ms * 1000
-	
-	mut k := 0
-	for (u64(1) << (k + 1)) <= t_val {
-		k++
-	}
-	t_val = u64(1) << k
-
-	t_big := big.integer_from_u64(t_val)
-	println('[+] Calculated squarings (t): ${t_val} operations for ${duration_sec} seconds lock')
-
-	mut a_hash := sha512.new()
-	a_hash.write(password.bytes()) or {}
-	a_hash.write(file_salt) or {}
-	a_bytes := a_hash.sum([]u8{})
-	mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
-	a = a % n
-	if a < big.integer_from_int(2) {
-		a = big.integer_from_int(2)
-	}
-
-	e := big.integer_from_int(2).big_mod_pow(t_big, phi_n)!
-	w_trapdoor := a.big_mod_pow(e, n)!
-
-	w_hash := sha512.sum512(w_trapdoor.str().bytes())
-	w_mask := w_hash[0..48]
-
-	println('[*] Generating Pietrzak VDF verification proof...')
+	mut n := big.integer_from_int(0)
+	mut t_val := u64(0)
+	mut w_trapdoor_bytes := []u8{}
 	mut proof := []big.Integer{}
-	pietrzak_prove(a, w_trapdoor, t_val, n, mut proof)!
 
-	println('[*] Deriving key with Argon2id (Memory: ${mem}KB, Iterations: ${iter})...')
-	salt := secure_random_bytes(16)!
+	if is_pq {
+		steps_per_ms := run_pq_calibration()
+		t_val = duration_sec * steps_per_ms * 1000
+		println('[+] Calculated SHA-512 hashes (t): ${t_val} operations for ${duration_sec} seconds lock')
+		
+		println('[*] Generating post-quantum VDF sequential solution...')
+		mut x := file_salt.clone()
+		for _ in 0 .. t_val {
+			x = sha512.sum512(x)
+		}
+		w_trapdoor_bytes = x[0..32].clone()
+	} else {
+		println('[*] Generating dynamic prime \$p (${prime_bits} bits)...')
+		p := generate_prime(prime_bits)!
+		println('[*] Generating dynamic prime \$q (${prime_bits} bits)...')
+		q := generate_prime(prime_bits)!
+		
+		n = p * q
+		one := big.integer_from_int(1)
+		phi_n := (p - one) * (q - one)
 
-	mut argon_key := argon2.d_key(password.bytes(), salt, iter, mem, threads, 48)!
-	defer {
-		zeroize(mut argon_key)
+		steps_per_ms := run_calibration(n)
+		t_val = duration_sec * steps_per_ms * 1000
+		
+		mut k := 0
+		for (u64(1) << (k + 1)) <= t_val {
+			k++
+		}
+		t_val = u64(1) << k
+
+		t_big := big.integer_from_u64(t_val)
+		println('[+] Calculated squarings (t): ${t_val} operations for ${duration_sec} seconds lock')
+
+		mut a_hash := sha512.new()
+		a_hash.write(password.bytes()) or {}
+		a_hash.write(file_salt) or {}
+		a_bytes := a_hash.sum([]u8{})
+		mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
+		a = a % n
+		if a < big.integer_from_int(2) {
+			a = big.integer_from_int(2)
+		}
+
+		e := big.integer_from_int(2).big_mod_pow(t_big, phi_n)!
+		w_trapdoor := a.big_mod_pow(e, n)!
+		w_trapdoor_bytes = w_trapdoor.str().bytes().clone()
+
+		println('[*] Generating Pietrzak VDF verification proof...')
+		pietrzak_prove(a, w_trapdoor, t_val, n, mut proof)!
 	}
 
-	mut final_key_bytes := xor_bytes(argon_key, w_mask)
-	defer {
-		zeroize(mut final_key_bytes)
-	}
-	
-	key_hex := final_key_bytes[0..32].hex()
-	iv_hex := final_key_bytes[32..48].hex()
+	mut rng := new_secure_prng()!
+	session_key := secure_random_bytes(32)!
+	session_iv := secure_random_bytes(16)!
+
+	key_hex := session_key.hex()
+	iv_hex := session_iv.hex()
 
 	println('[*] Deriving independent Seed 1 (Puzzle Locator)...')
 	seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
 
 	println('[*] Deriving independent Seed 2 (Payload Locator) bound to VDF Solution...')
-	seed_bytes2 := derive_seed2(seed2_str, w_trapdoor.str(), pbkdf2_iter)!
+	seed_bytes2 := derive_seed2(seed2_str, w_trapdoor_bytes.bytestr(), pbkdf2_iter)!
 	
-	header_key_iv := pbkdf2.key(password.bytes(), w_trapdoor.str().bytes(), pbkdf2_iter, 48, sha512.new())!
+	header_key_iv := pbkdf2.key(password.bytes(), file_salt, pbkdf2_iter, 48, sha512.new())!
 	header_key := header_key_iv[0..32].hex()
 	header_iv := header_key_iv[32..48].hex()
 
@@ -1219,8 +1317,38 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 
 	cipher_bytes := os.read_bytes(tmp_cipher_file)!
 
-	vdf_params := serialize_vdf_params(n, t_val)
-	header_raw := serialize_header(salt, iter, mem, threads, u32(cipher_bytes.len), proof)
+	mut lwe_ciphertext := []u8{}
+	mut salt := []u8{len: 16}
+	mut iter_val := iter
+	mut mem_val := mem
+	mut threads_val := threads
+
+	if is_pq {
+		s := sha512.sum512(w_trapdoor_bytes)[0..32].clone()
+		mut session_key_iv := []u8{cap: 48}
+		for byte in session_key { session_key_iv << byte }
+		for byte in session_iv { session_key_iv << byte }
+		lwe_ciphertext = lwe_encrypt(session_key_iv, s, mut rng)
+	} else {
+		salt = secure_random_bytes(16)!
+		mut argon_key := argon2.d_key(password.bytes(), salt, iter, mem, threads, 48)!
+		defer {
+			zeroize(mut argon_key)
+		}
+		w_hash := sha512.sum512(w_trapdoor_bytes)
+		w_mask := w_hash[0..48]
+		mut final_key_bytes := xor_bytes(argon_key, w_mask)
+		defer {
+			zeroize(mut final_key_bytes)
+		}
+		mut session_key_iv := []u8{cap: 48}
+		for byte in session_key { session_key_iv << byte }
+		for byte in session_iv { session_key_iv << byte }
+		lwe_ciphertext = xor_bytes(session_key_iv, final_key_bytes)
+	}
+
+	vdf_params := serialize_vdf_params(n, t_val, is_pq)
+	header_raw := serialize_header(salt, iter_val, mem_val, threads_val, u32(cipher_bytes.len), proof, lwe_ciphertext)
 	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
 
 	mut meta := []u8{}
@@ -1355,7 +1483,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 
 	n_dummy := generate_dynamic_dummy_params(password, file_salt, 1024)
 	vdf_p := deserialize_vdf_params(vdf_bytes) or {
-		VdfParams{ n: n_dummy, t: u64(100000) }
+		VdfParams{ n: n_dummy, t: u64(100000), is_pq: false }
 	}
 	mut n := vdf_p.n
 	mut t_val := vdf_p.t
@@ -1367,31 +1495,49 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		t_val = 100000
 	}
 
-	mut a_hash := sha512.new()
-	a_hash.write(password.bytes()) or {}
-	a_hash.write(file_salt) or {}
-	a_bytes := a_hash.sum([]u8{})
-	mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
-	a = a % n
-	if a < big.integer_from_int(2) {
-		a = big.integer_from_int(2)
-	}
+	mut a := big.integer_from_int(2)
+	mut x_bytes := []u8{}
+	mut x := big.integer_from_int(2)
 
-	println('[*] Resolving time-lock puzzle sequentially (t = ${t_val}). Please wait...')
-	start_time := time.now()
-	
-	progress_interval := if t_val >= 10 { t_val / 10 } else { u64(1) }
-	
-	mut x := a
-	for i in 0 .. t_val {
-		x = (x * x) % n
-		if i % progress_interval == 0 && i > 0 {
-			println('  [>] Progress: ${(i * 100) / t_val}% finished...')
+	if vdf_p.is_pq {
+		println('[*] Resolving post-quantum SHA-512 time-lock puzzle sequentially (t = ${t_val}). Please wait...')
+		start_time := time.now()
+		progress_interval := if t_val >= 10 { t_val / 10 } else { u64(1) }
+		mut x_pq := file_salt.clone()
+		for i in 0 .. t_val {
+			x_pq = sha512.sum512(x_pq)
+			if i % progress_interval == 0 && i > 0 {
+				println('  [>] Progress: ${(i * 100) / t_val}% finished...')
+			}
 		}
+		x_bytes = x_pq[0..32].clone()
+		println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
+	} else {
+		mut a_hash := sha512.new()
+		a_hash.write(password.bytes()) or {}
+		a_hash.write(file_salt) or {}
+		a_bytes := a_hash.sum([]u8{})
+		a = big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
+		a = a % n
+		if a < big.integer_from_int(2) {
+			a = big.integer_from_int(2)
+		}
+
+		println('[*] Resolving time-lock puzzle sequentially (t = ${t_val}). Please wait...')
+		start_time := time.now()
+		progress_interval := if t_val >= 10 { t_val / 10 } else { u64(1) }
+		x = a
+		for i in 0 .. t_val {
+			x = (x * x) % n
+			if i % progress_interval == 0 && i > 0 {
+				println('  [>] Progress: ${(i * 100) / t_val}% finished...')
+			}
+		}
+		x_bytes = x.str().bytes().clone()
+		println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
 	}
-	println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
 	
-	header_key_iv := pbkdf2.key(password.bytes(), x.str().bytes(), pbkdf2_iter, 48, sha512.new()) or { []u8{len: 48} }
+	header_key_iv := pbkdf2.key(password.bytes(), file_salt, pbkdf2_iter, 48, sha512.new()) or { []u8{len: 48} }
 	header_key := header_key_iv[0..32].hex()
 	header_iv := header_key_iv[32..48].hex()
 
@@ -1406,27 +1552,12 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 			threads: u8(4)
 			cipher_len: u32(total_len - meta_total_len)
 			proof: []big.Integer{}
+			lwe_ciphertext: []u8{}
 		}
 	}
-	mut salt := header.salt.clone()
-	mut iter := header.iter
-	mut mem := header.mem
-	mut threads := header.threads
+
 	mut cipher_len := header.cipher_len
 
-	if salt.len != 16 {
-		salt = []u8{len: 16}
-	}
-	if iter < 1 || iter > 100 {
-		iter = 3
-	}
-	if mem < 1024 || mem > 1048576 { 
-		mem = 65536
-	}
-	if threads < 1 || threads > 32 {
-		threads = 4
-	}
-	
 	mut remaining_indices := []int{cap: if total_len > meta_total_len { total_len - meta_total_len } else { 0 }}
 	if total_len > meta_total_len {
 		for i in meta_total_len .. total_len {
@@ -1440,11 +1571,44 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		safe_cipher_len = max_cipher
 	}
 
-	println('[*] Verifying mathematical integrity of the solved puzzle...')
-	_ = pietrzak_verify(a, x, t_val, header.proof, n) or { false }
-	println('[+] Mathematical verification of the puzzle proof: COMPLETE')
+	mut session_key := []u8{}
+	mut session_iv := []u8{}
 
-	seed_bytes2 := derive_seed2(seed2_str, x.str(), pbkdf2_iter) or { []u8{len: 64} }
+	if vdf_p.is_pq {
+		s := sha512.sum512(x_bytes)[0..32].clone()
+		dec_key_iv := lwe_decrypt(header.lwe_ciphertext, s, 48) or {
+			return error('Failed to decrypt LWE key: ' + err.msg())
+		}
+		session_key = dec_key_iv[0..32].clone()
+		session_iv = dec_key_iv[32..48].clone()
+		println('[+] Lattice-based LWE Post-Quantum verification: COMPLETE')
+	} else {
+		println('[*] Verifying mathematical integrity of the solved puzzle...')
+		_ = pietrzak_verify(a, x, t_val, header.proof, n) or { false }
+		println('[+] Mathematical verification of the puzzle proof: COMPLETE')
+
+		mut argon_key := argon2.d_key(password.bytes(), header.salt, header.iter, header.mem, header.threads, 48) or { []u8{len: 48} }
+		defer {
+			zeroize(mut argon_key)
+		}
+
+		w_hash := sha512.sum512(x_bytes)
+		w_mask := w_hash[0..48]
+
+		mut final_key_bytes := xor_bytes(argon_key, w_mask)
+		defer {
+			zeroize(mut final_key_bytes)
+		}
+		
+		if header.lwe_ciphertext.len != 48 {
+			return error('Malformed classic header ciphertext length')
+		}
+		dec_key_iv := xor_bytes(header.lwe_ciphertext, final_key_bytes)
+		session_key = dec_key_iv[0..32].clone()
+		session_iv = dec_key_iv[32..48].clone()
+	}
+
+	seed_bytes2 := derive_seed2(seed2_str, x_bytes.bytestr(), pbkdf2_iter) or { []u8{len: 64} }
 	
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
 	for i := remaining_indices.len - 1; i > 0; i-- {
@@ -1462,22 +1626,8 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		}
 	}
 
-	println('[*] Deriving K_argon using Argon2id...')
-	mut argon_key := argon2.d_key(password.bytes(), salt, iter, mem, threads, 48) or { []u8{len: 48} }
-	defer {
-		zeroize(mut argon_key)
-	}
-
-	w_hash := sha512.sum512(x.str().bytes())
-	w_mask := w_hash[0..48]
-
-	mut final_key_bytes := xor_bytes(argon_key, w_mask)
-	defer {
-		zeroize(mut final_key_bytes)
-	}
-	
-	key_hex := final_key_bytes[0..32].hex()
-	iv_hex := final_key_bytes[32..48].hex()
+	key_hex := session_key.hex()
+	iv_hex := session_iv.hex()
 
 	temp_dir := os.join_path(os.temp_dir(), 'lt_dec_${os.getpid()}')
 	os.mkdir(temp_dir)!
@@ -1521,6 +1671,7 @@ fn print_help() {
 	println('  -s1, --seed1 <str>         Independent password/seed to map the puzzle blocks')
 	println('  -s2, --seed2 <str>         Independent password/seed to map the payload blocks')
 	println('  -sh, --shred               Securely shred the original input file after successful execution')
+	println('  --classic                  Enable classical RSW96 VDF mode (Default is Post-Quantum SHA-512 + LWE-KEM)')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
 	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
 	println('  --threads <count>          Argon2 Threads (Default: 4)')
@@ -1651,7 +1802,7 @@ fn main() {
 
 	mut is_locktime := false
 	for a in args {
-		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s1', '--seed1', '-s2', '--seed2'] {
+		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s1', '--seed1', '-s2', '--seed2', '--classic'] {
 			is_locktime = true
 			break
 		}
@@ -1671,6 +1822,7 @@ fn main() {
 	mut prime_bits := 512
 	mut pbkdf2_iter := 200000
 	mut shred_orig := false
+	mut is_pq := true
 
 	mut message := ''
 	mut text_input := ''
@@ -1706,6 +1858,7 @@ fn main() {
 				'--prime' { if i + 1 < args.len { prime_bits = args[i+1].int(); i++ } }
 				'--pbkdf2-iter' { if i + 1 < args.len { pbkdf2_iter = args[i+1].int(); i++ } }
 				'-sh', '--shred' { shred_orig = true }
+				'--classic' { is_pq = false }
 				else {}
 			}
 		}
@@ -1721,7 +1874,7 @@ fn main() {
 		}
 
 		if mode == 'encrypt' {
-			locktime_encrypt_flow(file_path, out_path, duration, password, seed1_str, seed2_str, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig) or {
+			locktime_encrypt_flow(file_path, out_path, duration, password, seed1_str, seed2_str, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig, is_pq) or {
 				println('[-] Encryption Error: ${err}')
 			}
 		} else if mode == 'decrypt' {
