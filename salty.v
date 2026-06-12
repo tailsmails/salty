@@ -3,12 +3,78 @@ module main
 import os
 import math.big
 import crypto.argon2
-import crypto.sha512
-import crypto.pbkdf2
+import crypto.sha3
 import crypto.rand as crand
 import time
 import x.crypto.chacha20poly1305
 import compress.gzip
+fn C.memset(ptr voidptr, val int, size usize) voidptr
+
+fn hmac_sha3_512(key []u8, message []u8) []u8 {
+	block_size := 72
+	mut k := []u8{len: block_size, init: 0}
+	
+	if key.len > block_size {
+		hashed_key := sha3.sum512(key)
+		for i in 0 .. hashed_key.len {
+			k[i] = hashed_key[i]
+		}
+	} else {
+		for i in 0 .. key.len {
+			k[i] = key[i]
+		}
+	}
+
+	mut ipad := []u8{len: block_size, init: 0x36}
+	mut opad := []u8{len: block_size, init: 0x5c}
+
+	for i in 0 .. block_size {
+		ipad[i] ^= k[i]
+		opad[i] ^= k[i]
+	}
+	
+	mut inner_data := []u8{cap: block_size + message.len}
+	for b in ipad { inner_data << b }
+	for b in message { inner_data << b }
+	inner_hash := sha3.sum512(inner_data)
+	
+	mut outer_data := []u8{cap: block_size + inner_hash.len}
+	for b in opad { outer_data << b }
+	for b in inner_hash { outer_data << b }
+	return sha3.sum512(outer_data)
+}
+
+fn pbkdf2_sha3_512(password []u8, salt []u8, iter int, key_len int) []u8 {
+	hash_len := 64
+	num_blocks := (key_len + hash_len - 1) / hash_len
+	mut dk := []u8{cap: key_len}
+
+	for block_num := 1; block_num <= num_blocks; block_num++ {
+		mut u_data := []u8{cap: salt.len + 4}
+		for b in salt { u_data << b }
+		u_data << u8(block_num >> 24)
+		u_data << u8(block_num >> 16)
+		u_data << u8(block_num >> 8)
+		u_data << u8(block_num)
+
+		mut u := hmac_sha3_512(password, u_data)
+		mut block_xor := u.clone()
+		
+		for _ in 1 .. iter {
+			u = hmac_sha3_512(password, u)
+			for j in 0 .. hash_len {
+				block_xor[j] ^= u[j]
+			}
+		}
+		
+		remaining := key_len - dk.len
+		to_copy := if remaining < hash_len { remaining } else { hash_len }
+		for j in 0 .. to_copy {
+			dk << block_xor[j]
+		}
+	}
+	return dk
+}
 
 struct SecurePRNG {
 mut:
@@ -26,7 +92,7 @@ fn (mut rng SecurePRNG) next_u8() u8 {
 		write_u64(mut temp, rng.counter)
 		for b in temp { state << b }
 		rng.counter++
-		rng.buffer = sha512.sum512(state).clone()
+		rng.buffer = sha3.sum512(state).clone()
 		rng.idx = 0
 	}
 	val := rng.buffer[rng.idx]
@@ -44,11 +110,18 @@ fn (mut rng SecurePRNG) next_u32() u32 {
 
 fn (mut rng SecurePRNG) intn(n int) int {
 	if n <= 0 { return 0 }
-	return int(rng.next_u32() % u32(n))
+	limit := u32(-n) % u32(n)
+	for {
+		r := rng.next_u32()
+		if r >= limit {
+			return int(r % u32(n))
+		}
+	}
+	return 0
 }
 
 fn new_secure_prng_from_string(seed_str string) SecurePRNG {
-	hashed := sha512.sum512(seed_str.bytes())
+	hashed := sha3.sum512(seed_str.bytes())
 	return SecurePRNG{
 		seed: hashed.clone()
 		counter: 0
@@ -190,7 +263,7 @@ fn encrypt_payload_chacha20(plaintext string, password string, use_compression b
 		payload_bytes = gzip.compress(payload_bytes)!
 	}
 	salt := secure_random_bytes(16)!
-	key := pbkdf2.key(password.bytes(), salt, 10000, 32, sha512.new())!
+	key := pbkdf2_sha3_512(password.bytes(), salt, 10000, 32)
 	nonce := secure_random_bytes(12)!
 	encrypted := chacha20poly1305.encrypt(payload_bytes, key, nonce, []u8{})!
 	mut final_bytes := []u8{cap: salt.len + nonce.len + encrypted.len}
@@ -206,7 +279,7 @@ fn decrypt_payload_chacha20(hex_ciphertext string, password string, use_compress
 	salt := raw_data[0..16]
 	nonce := raw_data[16..28]
 	encrypted := raw_data[28..]
-	key := pbkdf2.key(password.bytes(), salt, 10000, 32, sha512.new())!
+	key := pbkdf2_sha3_512(password.bytes(), salt, 10000, 32)
 	mut payload_bytes := chacha20poly1305.decrypt(encrypted, key, nonce, []u8{}) or {
 		return error('Decryption failed (Wrong password or tampered data)')
 	}
@@ -706,8 +779,9 @@ fn read_u64(b []u8, offset int) u64 {
 }
 
 fn zeroize(mut b []u8) {
-	for i in 0 .. b.len {
-		b[i] = 0
+	if b.len == 0 { return }
+	unsafe {
+		C.memset(b.data, 0, b.len)
 	}
 }
 
@@ -719,10 +793,16 @@ fn secure_shred_file(path string) {
 			os.rm(path) or {}
 			return
 		}
-		mut random_data := secure_random_bytes(int(size)) or {
-			[]u8{len: int(size), init: 0x00}
+		chunk_size := 65536
+		mut remaining := size
+		for remaining > 0 {
+			to_write := if remaining < u64(chunk_size) { int(remaining) } else { chunk_size }
+			mut random_data := secure_random_bytes(to_write) or {
+				[]u8{len: to_write, init: 0x00}
+			}
+			f.write(random_data) or {}
+			remaining -= u64(to_write)
 		}
-		f.write(random_data) or {}
 		f.close()
 	}
 	os.rm(path) or {}
@@ -737,6 +817,32 @@ fn is_obviously_composite(n big.Integer) bool {
 		if n % bp == zero { return true }
 	}
 	return false
+}
+
+fn get_random_witness(n big.Integer, mut rng SecurePRNG) !big.Integer {
+	two := big.integer_from_int(2)
+	n_minus_2 := n - two
+	if n_minus_2 <= two {
+		return two
+	}
+	
+	n_hex := n.hex()
+	num_bytes := (n_hex.len + 1) / 2
+
+	for {
+		mut bytes := []u8{len: num_bytes}
+		for i in 0 .. num_bytes {
+			bytes[i] = rng.next_u8()
+		}
+
+		hex_str := bytes.hex()
+		candidate := big.integer_from_radix(hex_str, 16) or { continue }
+		
+		if candidate >= two && candidate <= n_minus_2 {
+			return candidate
+		}
+	}
+	return two
 }
 
 fn is_prime_mr(n big.Integer, k int) !bool {
@@ -754,12 +860,11 @@ fn is_prime_mr(n big.Integer, k int) !bool {
 		d = d / two
 		s++
 	}
+
 	mut rng := new_secure_prng()!
 	for _ in 0 .. k {
-		witnesses := [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
-		w_val := witnesses[rng.intn(witnesses.len)]
-		a := big.integer_from_int(w_val)
-		if a >= n_minus_1 { continue }
+		a := get_random_witness(n, mut rng)!
+		
 		mut x := a.big_mod_pow(d, n) or { return false }
 		if x == one || x == n_minus_1 {
 			continue
@@ -825,12 +930,12 @@ fn run_calibration(n big.Integer) u64 {
 }
 
 fn run_pq_calibration() u64 {
-	println('[*] Calibrating single-thread CPU performance for Post-Quantum SHA-512 VDF...')
+	println('[*] Calibrating single-thread CPU performance for Post-Quantum SHA-3-512 VDF...')
 	mut data := []u8{len: 64}
 	test_steps := u64(100000)
 	start := time.now()
 	for _ in 0 .. test_steps {
-		data = sha512.sum512(data)
+		data = sha3.sum512(data)
 	}
 	duration := time.since(start).milliseconds()
 	steps_per_ms := f64(test_steps) / f64(if duration == 0 { 1 } else { duration })
@@ -852,7 +957,7 @@ fn hash_to_challenge(x big.Integer, y big.Integer, v big.Integer, n big.Integer)
 	for b in y.str().bytes() { data << b }
 	for b in v.str().bytes() { data << b }
 	for b in n.str().bytes() { data << b }
-	hash := sha512.sum512(data)
+	hash := sha3.sum512(data)
 	hex_str := hash[0..32].hex()
 	return big.integer_from_radix(hex_str, 16) or { big.integer_from_int(0) }
 }
@@ -922,20 +1027,20 @@ fn deserialize_proof(b []u8, mut offset ProofIndex) ![]big.Integer {
 fn derive_seed1(seed_str string, file_salt []u8, pbkdf2_iter_val int) ![]u8 {
 	mut pbkdf2_iter := pbkdf2_iter_val
 	if pbkdf2_iter <= 0 { pbkdf2_iter = 200000 }
-	derived := pbkdf2.key(seed_str.bytes(), file_salt, pbkdf2_iter, 64, sha512.new())!
+	derived := pbkdf2_sha3_512(seed_str.bytes(), file_salt, pbkdf2_iter, 64)
 	return derived.clone()
 }
 
-fn derive_seed2(seed_str string, w_str string, iter int) ![]u8 {
-	derived := pbkdf2.key(seed_str.bytes(), w_str.bytes(), iter, 64, sha512.new())!
+fn derive_seed2(seed_str string, w_bytes []u8, iter int) ![]u8 {
+	derived := pbkdf2_sha3_512(seed_str.bytes(), w_bytes, iter, 64)
 	return derived.clone()
 }
 
 fn generate_dynamic_dummy_params(password string, file_salt []u8, bits int) big.Integer {
-	mut hasher := sha512.new()
-	hasher.write(password.bytes()) or {}
-	hasher.write(file_salt) or {}
-	seed := hasher.sum([]u8{})
+	mut data := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { data << b }
+	for b in file_salt { data << b }
+	seed := sha3.sum512(data)
 	mut rng := SecurePRNG{seed: seed}
 	mut bytes := []u8{len: bits / 8}
 	for i in 0 .. bytes.len {
@@ -1007,7 +1112,7 @@ fn deserialize_header(b []u8) !DecryptedHeader {
 	threads := b[24]
 	cipher_len := read_u32(b, 25)
 	key_len := read_u32(b, 29)
-	if int(key_len) < 0 || b.len < 33 + int(key_len) {
+	if u64(b.len) < 33 + u64(key_len) {
 		return error('Malformed header key size')
 	}
 	mut key_ciphertext := []u8{len: int(key_len)}
@@ -1058,11 +1163,11 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	if is_pq {
 		steps_per_ms := run_pq_calibration()
 		t_val = duration_sec * steps_per_ms * 1000
-		println('[+] Calculated SHA-512 hashes (t): ${t_val} operations for ${duration_sec} seconds lock')
+		println('[+] Calculated SHA-3-512 hashes (t): ${t_val} operations for ${duration_sec} seconds lock')
 		println('[*] Generating post-quantum VDF sequential solution...')
 		mut x := file_salt.clone()
 		for _ in 0 .. t_val {
-			x = sha512.sum512(x)
+			x = sha3.sum512(x)
 		}
 		w_trapdoor_bytes = x[0..32].clone()
 	} else {
@@ -1082,10 +1187,10 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		t_val = u64(1) << k
 		t_big := big.integer_from_u64(t_val)
 		println('[+] Calculated squarings (t): ${t_val} operations for ${duration_sec} seconds lock')
-		mut a_hash := sha512.new()
-		a_hash.write(password.bytes()) or {}
-		a_hash.write(file_salt) or {}
-		a_bytes := a_hash.sum([]u8{})
+		mut data_a := []u8{cap: password.len + file_salt.len}
+		for b in password.bytes() { data_a << b }
+		for b in file_salt { data_a << b }
+		a_bytes := sha3.sum512(data_a)
 		mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
 		a = a % n
 		if a < big.integer_from_int(2) {
@@ -1102,8 +1207,8 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	println('[*] Deriving independent Seed 1 (Puzzle Locator)...')
 	seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
 	println('[*] Deriving independent Seed 2 (Payload Locator) bound to VDF Solution...')
-	seed_bytes2 := derive_seed2(seed2_str, w_trapdoor_bytes.bytestr(), pbkdf2_iter)!
-	header_key_iv := pbkdf2.key(password.bytes(), file_salt, pbkdf2_iter, 48, sha512.new())!
+	seed_bytes2 := derive_seed2(seed2_str, w_trapdoor_bytes, pbkdf2_iter)!
+	header_key_iv := pbkdf2_sha3_512(password.bytes(), file_salt, pbkdf2_iter, 48)
 	header_key := header_key_iv[0..32].hex()
 	header_iv := header_key_iv[32..48].hex()
 	println('[*] Compressing and running internal ChaCha20-Poly1305 AEAD...')
@@ -1118,7 +1223,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	mut mem_val := mem
 	mut threads_val := threads
 	if is_pq {
-		s := sha512.sum512(w_trapdoor_bytes)
+		s := sha3.sum512(w_trapdoor_bytes)
 		pq_key := s[0..32].clone()
 		pq_iv := s[32..44].clone()
 		mut session_key_iv := []u8{cap: 48}
@@ -1131,7 +1236,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		defer {
 			zeroize(mut argon_key)
 		}
-		w_hash := sha512.sum512(w_trapdoor_bytes)
+		w_hash := sha3.sum512(w_trapdoor_bytes)
 		w_mask := w_hash[0..48]
 		mut final_key_bytes := xor_bytes(argon_key, w_mask)
 		defer {
@@ -1263,12 +1368,12 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	}
 	mut x_bytes := []u8{}
 	if vdf_p.is_pq {
-		println('[*] Resolving post-quantum SHA-512 time-lock puzzle sequentially (t = ${t_val}). Please wait...')
+		println('[*] Resolving post-quantum SHA-3-512 time-lock puzzle sequentially (t = ${t_val}). Please wait...')
 		start_time := time.now()
 		progress_interval := if t_val >= 10 { t_val / 10 } else { u64(1) }
 		mut x_pq := file_salt.clone()
 		for i in 0 .. t_val {
-			x_pq = sha512.sum512(x_pq)
+			x_pq = sha3.sum512(x_pq)
 			if i % progress_interval == 0 && i > 0 {
 				println('  [>] Progress: ${(i * 100) / t_val}% finished...')
 			}
@@ -1276,10 +1381,10 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		x_bytes = x_pq[0..32].clone()
 		println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
 	} else {
-		mut a_hash := sha512.new()
-		a_hash.write(password.bytes()) or {}
-		a_hash.write(file_salt) or {}
-		a_bytes := a_hash.sum([]u8{})
+		mut data_a := []u8{cap: password.len + file_salt.len}
+		for b in password.bytes() { data_a << b }
+		for b in file_salt { data_a << b }
+		a_bytes := sha3.sum512(data_a)
 		mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
 		a = a % n
 		if a < big.integer_from_int(2) {
@@ -1298,7 +1403,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		x_bytes = x.str().bytes().clone()
 		println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
 	}
-	header_key_iv := pbkdf2.key(password.bytes(), file_salt, pbkdf2_iter, 48, sha512.new()) or { []u8{len: 48} }
+	header_key_iv := pbkdf2_sha3_512(password.bytes(), file_salt, pbkdf2_iter, 48)
 	header_key := header_key_iv[0..32].hex()
 	header_iv := header_key_iv[32..48].hex()
 	dec_header_bytes := openssl_decrypt_header(enc_header_bytes, header_key, header_iv) or { []u8{} }
@@ -1329,7 +1434,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	mut session_key := []u8{}
 	mut session_iv := []u8{}
 	if vdf_p.is_pq {
-		s := sha512.sum512(x_bytes)
+		s := sha3.sum512(x_bytes)
 		pq_key := s[0..32].clone()
 		pq_iv := s[32..44].clone()
 		dec_key_iv := chacha20poly1305.decrypt(header.key_ciphertext, pq_key, pq_iv, []u8{}) or {
@@ -1340,10 +1445,10 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		println('[+] Symmetric Post-Quantum verification: COMPLETE')
 	} else {
 		println('[*] Verifying mathematical integrity of the solved puzzle...')
-		mut a_hash := sha512.new()
-		a_hash.write(password.bytes()) or {}
-		a_hash.write(file_salt) or {}
-		a_bytes := a_hash.sum([]u8{})
+		mut data_a := []u8{cap: password.len + file_salt.len}
+		for b in password.bytes() { data_a << b }
+		for b in file_salt { data_a << b }
+		a_bytes := sha3.sum512(data_a)
 		mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
 		a = a % n
 		if a < big.integer_from_int(2) {
@@ -1356,7 +1461,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		defer {
 			zeroize(mut argon_key)
 		}
-		w_hash := sha512.sum512(x_bytes)
+		w_hash := sha3.sum512(x_bytes)
 		w_mask := w_hash[0..48]
 		mut final_key_bytes := xor_bytes(argon_key, w_mask)
 		defer {
@@ -1369,7 +1474,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		session_key = dec_key_iv[0..32].clone()
 		session_iv = dec_key_iv[32..48].clone()
 	}
-	seed_bytes2 := derive_seed2(seed2_str, x_bytes.bytestr(), pbkdf2_iter) or { []u8{len: 64} }
+	seed_bytes2 := derive_seed2(seed2_str, x_bytes, pbkdf2_iter) or { []u8{len: 64} }
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
 	for i := remaining_indices.len - 1; i > 0; i-- {
 		j := shuffle_rng2.intn(i + 1)
@@ -1420,7 +1525,7 @@ fn print_help() {
 	println('  -s2, --seed2 <str>         Independent password/seed to map the payload blocks')
 	println('  -sh, --shred               Securely shred the original input file after successful execution')
 	println('  -c, --compress             Enable compression (In-memory gzip)')
-	println('  --classic                  Enable classical RSW96 VDF mode (Default is Post-Quantum SHA-512)')
+	println('  --classic                  Enable classical RSW96 VDF mode (Default is Post-Quantum SHA-3-512)')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
 	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
 	println('  --threads <count>          Argon2 Threads (Default: 4)')
