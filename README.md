@@ -7,8 +7,9 @@ Salty is a lightweight, high-performance command-line utility written in V for s
 ### 1. Locktime Engine (Sequential Time-Lock Cryptography)
 - **Post-Quantum Default VDF**: Salty utilizes a sequential SHA-512 Hash-Chain to enforce a rigorous time-lock delay, making offline brute-force attacks computationally impractical, even against future quantum-enabled hardware.
 - **Symmetric Post-Quantum Key Encapsulation**: A 256-bit symmetric session key and 12-byte nonce are derived dynamically from the solved VDF solution. The session key is encrypted using authenticated `ChaCha20-Poly1305` [1], providing robust quantum resistance with zero external C dependencies.
+- **Mathematical VDF-to-Header Binding (Oracle Immunity)**: To eliminate the "Key Confirmation Oracle" vulnerability, the encryption key for the metadata header (`header_key`) is cryptographically bound to the VDF solution ($w$) using PBKDF2-SHA3-512. Mathematically, the key to decrypt the header does not exist until the sequential VDF is solved. This forces any attacker to perform the CPU work before they can even attempt to decrypt the header or verify if their guessed seeds are correct, rendering client-side bypasses impossible.
 - **Zero-Knowledge Header Obfuscation (`Seed0`)**: Metadata parameters (memory, iterations, thread count, cipher length) are not stored as raw data. They are encoded as HMAC-SHA3-512 hashes. To reconstruct the header, the system performs a localized brute-force within logical bounds using a derived `Key_Seed0`. This renders the file header completely opaque to statistical analysis and prevents "metadata leakage" (i.e., fingerprinting the encryption settings).
-- **Triple-Key Security Model (Oracle-Resistance)**: 
+- **Triple-Key Security Model**: 
     - **Master Password**: Used for Argon2id derivation and payload encryption.
     - **Seed 1 (`-s1`)**: Locator key for mapping the puzzle/metadata block.
     - **Seed 2 (`-s2`)**: Locator key for mapping the encrypted payload.
@@ -67,8 +68,8 @@ pkg update -y && pkg install -y git clang make zstd && if ! command -v v >/dev/n
 ## Security Model
 **Salty** provides a defense-in-depth architecture:
 1. **Asymmetric Sequential Delay (VDF)**: Forces a mathematical wait-time of $T$ seconds *per password guess* that cannot be bypassed by parallelization.
-2. **Post-Quantum Symmetric Key Wrapping**: Derives keying material from the VDF solution, creating a temporal and cryptographic dependency.
-3. **Pure-V Cryptographic Pipeline**: Mitigates risk of command-line leakage and guarantees AEAD integrity.
+2. **Cryptographic Key Binding (Mathematical Enforcement)**: By deriving the metadata decryption key directly from the VDF solution ($w$), the cryptographic pipeline is secured against client-side bypasses. Attackers cannot modify the decryption binary to skip the sequential delay, as the decryption key mathematically does not exist prior to solving the VDF.
+3. **Transparent VDF Parameters**: VDF parameters ($N, t$, is_pq) are stored as standard, unencrypted metadata at the beginning of the file. This aligns with standard time-lock puzzle design, preventing structural leakage or "garbage parameter" bounds-check oracle leaks while preserving the mathematical hardness of the sequential work.
 4. **Header Metadata Obfuscation (`Seed0`)**: By brute-forcing HMAC-based parameters, the file header remains indistinguishable from high-entropy noise, preventing attackers from verifying configuration settings or validating password guesses (Oracle Resistance).
 5. **Robust Bounds Checking**: Strict size validation ensures immunity to memory allocation panics under wrong password or garbage inputs.
 6. **Forensic Erasure**: Active Zeroization and Secure Shredding ensure no forensic remnants remain.
