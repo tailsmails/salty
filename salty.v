@@ -1080,15 +1080,6 @@ fn deserialize_vdf_params(b []u8) !VdfParams {
 	return VdfParams{ n: n, t: t, is_pq: is_pq }
 }
 
-fn is_sane_header(h DecryptedHeader, slot_size int) bool {
-	if h.iter < 1 || h.iter > 50000 { return false }
-	if h.mem < 1024 || h.mem > 1048576 { return false } 
-	if h.threads < 1 || h.threads > 64 { return false }
-	if h.lwe_dim < 128 || h.lwe_dim > 4096 { return false }
-	if int(h.cipher_len) <= 0 || int(h.cipher_len) > slot_size { return false }
-	return true
-}
-
 fn serialize_header(salt []u8, iter u32, mem u32, threads u8, lwe_dim u16, cipher_len u32, proof []big.Integer, lwe_ciphertext []u8) []u8 {
 	mut b := []u8{}
 	for byte in salt { b << byte }
@@ -1243,25 +1234,14 @@ fn lwe_decrypt(cipher []u8, base_secret []u8, data_len int, dim int) ![]u8 {
 	return data
 }
 
-fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1_str string, seed2_str string, seed11_str string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool, is_pq bool, lwe_dim u16, capacity int) ! {
+fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1_str string, seed2_str string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool, is_pq bool, lwe_dim u16) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
-	if prime_bits < 256 || prime_bits > 4096 { return error('Prime bit length must be between 256 and 4096.') }
 	
-	mut is_inject := false
-	mut existing_bytes := []u8{}
-	if os.exists(out_path) {
-		existing_bytes = os.read_bytes(out_path)!
-		if existing_bytes.len >= 32 {
-			is_inject = true
-		}
+	if prime_bits < 256 || prime_bits > 4096 {
+		return error('Prime bit length must be between 256 and 4096.')
 	}
-
-	mut file_salt := []u8{}
-	if is_inject {
-		file_salt = existing_bytes[0..32].clone()
-	} else {
-		file_salt = secure_random_bytes(32)!
-	}
+	
+	file_salt := secure_random_bytes(32)!
 
 	mut n := big.integer_from_int(0)
 	mut t_val := u64(0)
@@ -1275,7 +1255,9 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		
 		println('[*] Generating post-quantum VDF sequential solution...')
 		mut x := file_salt.clone()
-		for _ in 0 .. t_val { x = sha512.sum512(x) }
+		for _ in 0 .. t_val {
+			x = sha512.sum512(x)
+		}
 		w_trapdoor_bytes = x[0..32].clone()
 	} else {
 		println('[*] Generating dynamic prime \$p (${prime_bits} bits)...')
@@ -1291,7 +1273,9 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		t_val = duration_sec * steps_per_ms * 1000
 		
 		mut k := 0
-		for (u64(1) << (k + 1)) <= t_val { k++ }
+		for (u64(1) << (k + 1)) <= t_val {
+			k++
+		}
 		t_val = u64(1) << k
 
 		t_big := big.integer_from_u64(t_val)
@@ -1303,7 +1287,9 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		a_bytes := a_hash.sum([]u8{})
 		mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
 		a = a % n
-		if a < big.integer_from_int(2) { a = big.integer_from_int(2) }
+		if a < big.integer_from_int(2) {
+			a = big.integer_from_int(2)
+		}
 
 		e := big.integer_from_int(2).big_mod_pow(t_big, phi_n)!
 		w_trapdoor := a.big_mod_pow(e, n)!
@@ -1323,7 +1309,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	println('[*] Deriving independent Seed 1 (Puzzle Locator)...')
 	seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
 
-	println('[*] Deriving independent Seed 2 (Payload Locator)...')
+	println('[*] Deriving independent Seed 2 (Payload Locator) bound to VDF Solution...')
 	seed_bytes2 := derive_seed2(seed2_str, w_trapdoor_bytes.bytestr(), pbkdf2_iter)!
 	
 	header_key_iv := pbkdf2.key(password.bytes(), file_salt, pbkdf2_iter, 48, sha512.new())!
@@ -1337,15 +1323,18 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 
 	tmp_cipher_file := os.join_path(temp_dir, 'lt_tmp.bin')
 
-	println('[*] Running OpenSSL ChaCha20 encryption engine...')
+	println('[*] Running OpenSSL ChaCha20 encryption engine with inline ZSTD compression...')
 	openssl_cmd := 'zstd -19 -c -q -f ${os.quoted_path(file_path)} | openssl enc -chacha20 -e -K ${key_hex} -iv ${iv_hex} -out ${os.quoted_path(tmp_cipher_file)}'
 	res := os.execute(openssl_cmd)
-	if res.exit_code != 0 { return error('OpenSSL pipeline failed.') }
+	if res.exit_code != 0 { return error('OpenSSL pipeline execution failed. Ensure zstd and openssl are installed.') }
 
 	cipher_bytes := os.read_bytes(tmp_cipher_file)!
 
 	mut lwe_ciphertext := []u8{}
 	mut salt := []u8{len: 16}
+	mut iter_val := iter
+	mut mem_val := mem
+	mut threads_val := threads
 
 	if is_pq {
 		s := sha512.sum512(w_trapdoor_bytes)[0..32].clone()
@@ -1356,11 +1345,15 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	} else {
 		salt = secure_random_bytes(16)!
 		mut argon_key := argon2.d_key(password.bytes(), salt, iter, mem, threads, 48)!
-		defer { zeroize(mut argon_key) }
+		defer {
+			zeroize(mut argon_key)
+		}
 		w_hash := sha512.sum512(w_trapdoor_bytes)
 		w_mask := w_hash[0..48]
 		mut final_key_bytes := xor_bytes(argon_key, w_mask)
-		defer { zeroize(mut final_key_bytes) }
+		defer {
+			zeroize(mut final_key_bytes)
+		}
 		mut session_key_iv := []u8{cap: 48}
 		for byte in session_key { session_key_iv << byte }
 		for byte in session_iv { session_key_iv << byte }
@@ -1368,7 +1361,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	}
 
 	vdf_params := serialize_vdf_params(n, t_val, is_pq)
-	header_raw := serialize_header(salt, iter, mem, threads, lwe_dim, u32(cipher_bytes.len), proof, lwe_ciphertext)
+	header_raw := serialize_header(salt, iter_val, mem_val, threads_val, lwe_dim, u32(cipher_bytes.len), proof, lwe_ciphertext)
 	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
 
 	mut meta := []u8{}
@@ -1377,93 +1370,42 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	for b in vdf_params { meta << b }
 	for b in encrypted_header { meta << b }
 
+	println('[*] Performing decoupled double-seed byte-level interleaving (No trial-leak)...')
 	data_len := meta.len + cipher_bytes.len
-	mut total_len := 0
-	mut slot_size := 0
-	mut mixed := []u8{}
-
-	if is_inject {
-		mixed = existing_bytes[32..].clone()
-		total_len = mixed.len
-		slot_size = total_len / 10
-		if data_len > slot_size {
-			return error('Payload too large to inject into existing container slots. (Needs ${data_len}, Slot size is ${slot_size})')
-		}
-	} else {
-		mut slot_size_calc := data_len + 256
-		if capacity > slot_size_calc {
-			slot_size_calc = capacity
-		}
-		slot_size = slot_size_calc
-		total_len = slot_size * 10
-		mixed = []u8{len: total_len}
-		mut master_noise_seed := sha512.sum512(file_salt)
-		mut noise_rng := SecurePRNG{seed: master_noise_seed}
-		for i in 0 .. total_len {
-			mixed[i] = noise_rng.next_u8()
-		}
-	}
-
-	mut master_noise_seed_check := sha512.sum512(file_salt)
-	mut noise_rng_check := SecurePRNG{seed: master_noise_seed_check}
-	mut expected_mixed := []u8{len: total_len}
-	for i in 0 .. total_len {
-		expected_mixed[i] = noise_rng_check.next_u8()
-	}
-
-	println('[*] Scanning container and generating Plausible Deniability slots using Volume Locator Seed 11...')
-	seed_bytes11 := derive_seed1(seed11_str, file_salt, pbkdf2_iter)!
+	total_len := data_len * 2
 	
-	mut slot_indices := []int{len: 10}
-	for i in 0 .. 10 { slot_indices[i] = i }
-	mut slot_rng := SecurePRNG{seed: seed_bytes11}
-	for i := 9; i > 0; i-- {
-		j := slot_rng.intn(i + 1)
-		slot_indices[i], slot_indices[j] = slot_indices[j], slot_indices[i]
+	mut mixed := []u8{len: total_len}
+	mut mixed_seed := []u8{cap: 128}
+	for b in seed_bytes1 { mixed_seed << b }
+	for b in seed_bytes2 { mixed_seed << b }
+	mut junk_rng := SecurePRNG{seed: mixed_seed}
+	for i in 0 .. total_len {
+		mixed[i] = u8(junk_rng.next_u8() & 0xFF)
 	}
-
-	mut chosen_slot := -1
-	for s in slot_indices {
-		start_idx := s * slot_size
-		end_idx := start_idx + slot_size
-		mut is_empty := true
-		for i in start_idx .. end_idx {
-			if mixed[i] != expected_mixed[i] {
-				is_empty = false
-				break
-			}
-		}
-		if is_empty {
-			chosen_slot = s
-			break
-		}
-	}
-
-	if chosen_slot == -1 {
-		return error('No empty slots available in the container! All slots are occupied or corrupted.')
-	}
-
-	println('[+] Found clean slot at internal index ${chosen_slot}. Injecting payload...')
-
-	mut all_indices := []int{len: slot_size}
-	for i in 0 .. slot_size { all_indices[i] = i }
+	
+	mut all_indices := []int{len: total_len}
+	for i in 0 .. total_len { all_indices[i] = i }
 	
 	mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
-	for i := slot_size - 1; i > 0; i-- {
+	for i := total_len - 1; i > 0; i-- {
 		j := shuffle_rng1.intn(i + 1)
 		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
 	}
 	
 	meta_len := meta.len
 	mut meta_indices := []int{cap: meta_len}
-	for i in 0 .. meta_len { meta_indices << all_indices[i] }
+	for i in 0 .. meta_len {
+		meta_indices << all_indices[i]
+	}
 	
-	slot_offset := chosen_slot * slot_size
-
-	for i in 0 .. meta_len { mixed[slot_offset + meta_indices[i]] = meta[i] }
+	for i in 0 .. meta_len {
+		mixed[meta_indices[i]] = meta[i]
+	}
 	
-	mut remaining_indices := []int{cap: slot_size - meta_len}
-	for i in meta_len .. slot_size { remaining_indices << all_indices[i] }
+	mut remaining_indices := []int{cap: total_len - meta_len}
+	for i in meta_len .. total_len {
+		remaining_indices << all_indices[i]
+	}
 	
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
 	for i := remaining_indices.len - 1; i > 0; i-- {
@@ -1472,7 +1414,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	}
 	
 	for i in 0 .. cipher_bytes.len {
-		mixed[slot_offset + remaining_indices[i]] = cipher_bytes[i]
+		mixed[remaining_indices[i]] = cipher_bytes[i]
 	}
 
 	mut final_output := []u8{cap: file_salt.len + mixed.len}
@@ -1480,125 +1422,106 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	for b in mixed { final_output << b }
 
 	os.write_bytes(out_path, final_output)!
-	if is_inject {
-		println('[+] Data successfully and seamlessly embedded into previous container: ${out_path}')
-	} else {
-		println('[+] New Homogeneous Slot-based binary container saved to: ${out_path}')
-	}
+	println('[+] Homogeneous binary file successfully saved to: ${out_path}')
 	
-	if shred_orig { secure_shred_file(file_path) }
+	if shred_orig {
+		println('[*] Securely shredding original input file: ${file_path} ...')
+		secure_shred_file(file_path)
+	}
 }
 
-fn locktime_decrypt_flow(file_path string, out_path string, password string, seed1_str string, seed2_str string, seed11_str string, pbkdf2_iter int, shred_orig bool) ! {
+fn locktime_decrypt_flow(file_path string, out_path string, password string, seed1_str string, seed2_str string, pbkdf2_iter int, shred_orig bool) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
-	if os.exists(out_path) { os.rm(out_path) or {} }
+	
+	if os.exists(out_path) {
+		os.rm(out_path) or {}
+	}
 
-	println('[*] Reading homogeneous raw container...')
+	println('[*] Reading homogeneous raw binary file...')
 	file_bytes := os.read_bytes(file_path)!
-	if file_bytes.len < 132 { return error('File is too small to contain valid metadata!') }
+	
+	if file_bytes.len < 75 {
+		return error('File is too small to contain valid metadata!')
+	}
 
 	file_salt := file_bytes[0..32].clone()
 	mixed := file_bytes[32..].clone()
 	total_len := mixed.len
-	slot_size := total_len / 10
-
-	if slot_size < 10 { return error('File structure does not map to slotted container.') }
-
-	println('[*] Authenticating through hidden volumes using Seed 11...')
-	seed_bytes11 := derive_seed1(seed11_str, file_salt, pbkdf2_iter)!
-	
-	mut slot_indices := []int{len: 10}
-	for i in 0 .. 10 { slot_indices[i] = i }
-	mut slot_rng := SecurePRNG{seed: seed_bytes11}
-	for i := 9; i > 0; i-- {
-		j := slot_rng.intn(i + 1)
-		slot_indices[i], slot_indices[j] = slot_indices[j], slot_indices[i]
-	}
 
 	seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
-	header_key_iv := pbkdf2.key(password.bytes(), file_salt, pbkdf2_iter, 48, sha512.new()) or { []u8{len: 48} }
-	header_key := header_key_iv[0..32].hex()
-	header_iv := header_key_iv[32..48].hex()
 
-	mut found_slot := -1
-	mut valid_vdf_p := VdfParams{}
-	mut valid_dec_header := []u8{}
-	mut valid_vdf_bytes := []u8{}
-	mut valid_all_indices := []int{}
+	mut all_indices := []int{len: total_len}
+	for i in 0 .. total_len { all_indices[i] = i }
+	
+	mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
+	for i := total_len - 1; i > 0; i-- {
+		j := shuffle_rng1.intn(i + 1)
+		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
+	}
 
-	for s in slot_indices {
-		slot_offset := s * slot_size
+	mut meta_prefix := []u8{len: 6}
+	for i in 0 .. 6 {
+		meta_prefix[i] = mixed[all_indices[i]]
+	}
+	vdf_len := read_u16(meta_prefix, 0)
+	enc_header_len := read_u32(meta_prefix, 2)
 
-		mut all_indices := []int{len: slot_size}
-		for i in 0 .. slot_size { all_indices[i] = i }
-		
-		mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
-		for i := slot_size - 1; i > 0; i-- {
-			j := shuffle_rng1.intn(i + 1)
-			all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
-		}
+	mut safe_vdf_len := int(vdf_len)
+	mut safe_enc_header_len := int(enc_header_len)
+	mut rem_space := total_len - 6
+	if rem_space < 2 { rem_space = 2 }
 
-		mut meta_prefix := []u8{len: 6}
-		for i in 0 .. 6 { meta_prefix[i] = mixed[slot_offset + all_indices[i]] }
-		
-		vdf_len := read_u16(meta_prefix, 0)
-		enc_header_len := read_u32(meta_prefix, 2)
+	if safe_vdf_len <= 0 || safe_enc_header_len <= 0 || safe_vdf_len > rem_space || safe_enc_header_len > rem_space || safe_vdf_len + safe_enc_header_len > rem_space {
+		safe_vdf_len = rem_space / 2
+		safe_enc_header_len = rem_space - safe_vdf_len
+	}
 
-		safe_vdf_len := int(vdf_len)
-		safe_enc_header_len := int(enc_header_len)
+	meta_total_len := 6 + safe_vdf_len + safe_enc_header_len
 
-		if safe_vdf_len <= 0 || safe_enc_header_len <= 0 || safe_vdf_len + safe_enc_header_len + 6 > slot_size {
-			continue 
-		}
-
-		mut vdf_bytes := []u8{len: safe_vdf_len}
-		for i in 0 .. safe_vdf_len {
-			vdf_bytes[i] = mixed[slot_offset + all_indices[6 + i]]
-		}
-
-		mut enc_header_bytes := []u8{len: safe_enc_header_len}
-		for i in 0 .. safe_enc_header_len {
-			enc_header_bytes[i] = mixed[slot_offset + all_indices[6 + safe_vdf_len + i]]
-		}
-
-		dec_header_bytes := openssl_decrypt_header(enc_header_bytes, header_key, header_iv) or { continue }
-		header_parsed := deserialize_header(dec_header_bytes) or { continue }
-		
-		if is_sane_header(header_parsed, slot_size) {
-			vdf_p := deserialize_vdf_params(vdf_bytes) or { continue }
-			valid_vdf_p = vdf_p
-			valid_dec_header = dec_header_bytes.clone()
-			valid_vdf_bytes = vdf_bytes.clone()
-			valid_all_indices = all_indices.clone()
-			found_slot = s
-			break
+	mut vdf_bytes := []u8{len: safe_vdf_len}
+	for i in 0 .. safe_vdf_len {
+		idx := 6 + i
+		if idx >= 0 && idx < all_indices.len {
+			vdf_bytes[i] = mixed[all_indices[idx]]
 		}
 	}
 
-	if found_slot == -1 {
-		return error('Decryption failed: Could not find a valid volume for the provided Seed 11 and Password combination.')
+	mut enc_header_bytes := []u8{len: safe_enc_header_len}
+	for i in 0 .. safe_enc_header_len {
+		idx := 6 + safe_vdf_len + i
+		if idx >= 0 && idx < all_indices.len {
+			enc_header_bytes[i] = mixed[all_indices[idx]]
+		}
 	}
 
-	println('[+] Discovered valid hidden volume in internal slot ${found_slot}. Executing puzzle constraints...')
+	n_dummy := generate_dynamic_dummy_params(password, file_salt, 1024)
+	vdf_p := deserialize_vdf_params(vdf_bytes) or {
+		VdfParams{ n: n_dummy, t: u64(100000), is_pq: false }
+	}
+	mut n := vdf_p.n
+	mut t_val := vdf_p.t
 
-	mut n := valid_vdf_p.n
-	mut t_val := valid_vdf_p.t
-
-	if n <= big.integer_from_int(2) { n = generate_dynamic_dummy_params(password, file_salt, 1024) }
-	if t_val < 1 || t_val > 50000000 { t_val = 100000 }
+	if n <= big.integer_from_int(2) {
+		n = n_dummy
+	}
+	if t_val < 1 || t_val > 50000000 {
+		t_val = 100000
+	}
 
 	mut a := big.integer_from_int(2)
 	mut x_bytes := []u8{}
 	mut x := big.integer_from_int(2)
 
-	if valid_vdf_p.is_pq {
+	if vdf_p.is_pq {
 		println('[*] Resolving post-quantum SHA-512 time-lock puzzle sequentially (t = ${t_val}). Please wait...')
 		start_time := time.now()
 		progress_interval := if t_val >= 10 { t_val / 10 } else { u64(1) }
 		mut x_pq := file_salt.clone()
 		for i in 0 .. t_val {
 			x_pq = sha512.sum512(x_pq)
-			if i % progress_interval == 0 && i > 0 { println('  [>] Progress: ${(i * 100) / t_val}% finished...') }
+			if i % progress_interval == 0 && i > 0 {
+				println('  [>] Progress: ${(i * 100) / t_val}% finished...')
+			}
 		}
 		x_bytes = x_pq[0..32].clone()
 		println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
@@ -1609,7 +1532,9 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		a_bytes := a_hash.sum([]u8{})
 		a = big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
 		a = a % n
-		if a < big.integer_from_int(2) { a = big.integer_from_int(2) }
+		if a < big.integer_from_int(2) {
+			a = big.integer_from_int(2)
+		}
 
 		println('[*] Resolving time-lock puzzle sequentially (t = ${t_val}). Please wait...')
 		start_time := time.now()
@@ -1617,31 +1542,57 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		x = a
 		for i in 0 .. t_val {
 			x = (x * x) % n
-			if i % progress_interval == 0 && i > 0 { println('  [>] Progress: ${(i * 100) / t_val}% finished...') }
+			if i % progress_interval == 0 && i > 0 {
+				println('  [>] Progress: ${(i * 100) / t_val}% finished...')
+			}
 		}
 		x_bytes = x.str().bytes().clone()
 		println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
 	}
 	
-	header := deserialize_header(valid_dec_header) or { return error('Failed parsing authenticated header payload.') }
+	header_key_iv := pbkdf2.key(password.bytes(), file_salt, pbkdf2_iter, 48, sha512.new()) or { []u8{len: 48} }
+	header_key := header_key_iv[0..32].hex()
+	header_iv := header_key_iv[32..48].hex()
+
+	dec_header_bytes := openssl_decrypt_header(enc_header_bytes, header_key, header_iv) or { []u8{} }
+	
+	header := deserialize_header(dec_header_bytes) or {
+		dummy_salt := []u8{len: 16}
+		DecryptedHeader{
+			salt: dummy_salt
+			iter: u32(3)
+			mem: u32(65536)
+			threads: u8(4)
+			lwe_dim: u16(512)
+			cipher_len: u32(total_len - meta_total_len)
+			proof: []big.Integer{}
+			lwe_ciphertext: []u8{}
+		}
+	}
 
 	mut cipher_len := header.cipher_len
-	meta_total_len := 6 + valid_vdf_bytes.len + valid_dec_header.len
 
-	mut remaining_indices := []int{cap: slot_size - meta_total_len}
-	for i in meta_total_len .. slot_size { remaining_indices << valid_all_indices[i] }
+	mut remaining_indices := []int{cap: if total_len > meta_total_len { total_len - meta_total_len } else { 0 }}
+	if total_len > meta_total_len {
+		for i in meta_total_len .. total_len {
+			remaining_indices << all_indices[i]
+		}
+	}
 
 	mut safe_cipher_len := int(cipher_len)
-	if safe_cipher_len <= 0 || safe_cipher_len > remaining_indices.len {
-		return error('Invalid cipher length in header bounds')
+	max_cipher := remaining_indices.len
+	if safe_cipher_len <= 0 || safe_cipher_len > max_cipher {
+		safe_cipher_len = max_cipher
 	}
 
 	mut session_key := []u8{}
 	mut session_iv := []u8{}
 
-	if valid_vdf_p.is_pq {
+	if vdf_p.is_pq {
 		s := sha512.sum512(x_bytes)[0..32].clone()
-		dec_key_iv := lwe_decrypt(header.lwe_ciphertext, s, 48, int(header.lwe_dim)) or { return error('Failed to decrypt LWE key: ' + err.msg()) }
+		dec_key_iv := lwe_decrypt(header.lwe_ciphertext, s, 48, int(header.lwe_dim)) or {
+			return error('Failed to decrypt LWE key: ' + err.msg())
+		}
 		session_key = dec_key_iv[0..32].clone()
 		session_iv = dec_key_iv[32..48].clone()
 		println('[+] Lattice-based LWE Post-Quantum verification: COMPLETE')
@@ -1651,15 +1602,21 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		println('[+] Mathematical verification of the puzzle proof: COMPLETE')
 
 		mut argon_key := argon2.d_key(password.bytes(), header.salt, header.iter, header.mem, header.threads, 48) or { []u8{len: 48} }
-		defer { zeroize(mut argon_key) }
+		defer {
+			zeroize(mut argon_key)
+		}
 
 		w_hash := sha512.sum512(x_bytes)
 		w_mask := w_hash[0..48]
 
 		mut final_key_bytes := xor_bytes(argon_key, w_mask)
-		defer { zeroize(mut final_key_bytes) }
+		defer {
+			zeroize(mut final_key_bytes)
+		}
 		
-		if header.lwe_ciphertext.len != 48 { return error('Malformed classic header ciphertext length') }
+		if header.lwe_ciphertext.len != 48 {
+			return error('Malformed classic header ciphertext length')
+		}
 		dec_key_iv := xor_bytes(header.lwe_ciphertext, final_key_bytes)
 		session_key = dec_key_iv[0..32].clone()
 		session_iv = dec_key_iv[32..48].clone()
@@ -1673,11 +1630,14 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
 	}
 
-	slot_offset := found_slot * slot_size
 	mut cipher_bytes := []u8{len: safe_cipher_len}
 	for i in 0 .. safe_cipher_len {
-		idx := remaining_indices[i]
-		cipher_bytes[i] = mixed[slot_offset + idx]
+		if i >= 0 && i < remaining_indices.len {
+			idx := remaining_indices[i]
+			if idx >= 0 && idx < mixed.len {
+				cipher_bytes[i] = mixed[idx]
+			}
+		}
 	}
 
 	key_hex := session_key.hex()
@@ -1696,11 +1656,14 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	res := os.execute(pipeline_cmd)
 
 	if res.exit_code != 0 {
-		if os.exists(out_path) { os.rm(out_path) or {} }
+		if os.exists(out_path) {
+			os.rm(out_path) or {}
+		}
 		return error('Decryption or decompression failed. Data corruption or invalid parameters.')
 	}
 
 	println('[+] Decrypted file successfully saved to: ${out_path}')
+	
 	if shred_orig {
 		println('[*] Securely shredding encrypted carrier file: ${file_path} ...')
 		secure_shred_file(file_path)
@@ -1716,12 +1679,11 @@ fn print_help() {
 	println('  interactive                Run Salty interactive stego menu')
 	println('\nLocktime (Time-Lock Encryption) Options:')
 	println('  -f, --file <path>          Input file to encrypt/decrypt')
-	println('  -o, --out <path>           Output file path (If exists, payloads will be injected automatically)')
+	println('  -o, --out <path>           Output file path')
 	println('  -t, --time <seconds>       Time-lock duration in seconds (Default: 10)')
 	println('  -p, --pass <password>      Master password for ChaCha20/Header encryption')
 	println('  -s1, --seed1 <str>         Independent password/seed to map the puzzle blocks')
 	println('  -s2, --seed2 <str>         Independent password/seed to map the payload blocks')
-	println('  -s11, --seed11 <str>       Volume Locator Seed (Master Seed for Plausible Deniability/Slots)')
 	println('  -sh, --shred               Securely shred the original input file after successful execution')
 	println('  --classic                  Enable classical RSW96 VDF mode (Default is Post-Quantum SHA-512 + LWE-KEM)')
 	println('  --lwe-dim <size>           Lattice dimension for PQ KEM (Default: 512, Min: 256)')
@@ -1730,7 +1692,6 @@ fn print_help() {
 	println('  --threads <count>          Argon2 Threads (Default: 4)')
 	println('  --prime <bits>             Size of dynamic primes in bits (Default: 512)')
 	println('  --pbkdf2-iter <count>      PBKDF2 iterations for structural key stretching (Default: 200000)')
-	println('  --capacity <size>          Custom slot size capacity for future injections (e.g., "500K", "2M")')
 	println('\nSalty Steganography Options:')
 	println('  -m, --message <str>        Plaintext message to hide')
 	println('  -t, --text <str>           Cover text (for encrypt) or carrier text (for decrypt)')
@@ -1830,17 +1791,6 @@ fn run_salty_interactive() ! {
 	}
 }
 
-fn parse_capacity(raw string) int {
-	if raw == '' { return 0 }
-	mut clean := raw.to_upper()
-	if clean.ends_with('M') {
-		return clean.replace('M', '').trim_space().int() * 1024 * 1024
-	} else if clean.ends_with('K') {
-		return clean.replace('K', '').trim_space().int() * 1024
-	}
-	return clean.int()
-}
-
 fn main() {
 	args := os.args
 	if args.len == 1 {
@@ -1867,7 +1817,7 @@ fn main() {
 
 	mut is_locktime := false
 	for a in args {
-		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s1', '--seed1', '-s2', '--seed2', '-s11', '--seed11', '--capacity', '--classic', '--lwe-dim'] {
+		if a in ['--prime', '--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s1', '--seed1', '-s2', '--seed2', '--classic', '--lwe-dim'] {
 			is_locktime = true
 			break
 		}
@@ -1889,7 +1839,6 @@ fn main() {
 	mut shred_orig := false
 	mut is_pq := true
 	mut lwe_dim := u16(512)
-	mut capacity_str := ''
 
 	mut message := ''
 	mut text_input := ''
@@ -1897,7 +1846,6 @@ fn main() {
 	mut password := ''
 	mut seed1_str := ''
 	mut seed2_str := ''
-	mut seed11_str := ''
 	mut seed_val := u64(0)
 	mut raw_formats := ''
 	mut typo_intensity := 0
@@ -1920,8 +1868,6 @@ fn main() {
 				'-p', '--pass' { if i + 1 < args.len { password = args[i+1]; i++ } }
 				'-s1', '--seed1' { if i + 1 < args.len { seed1_str = args[i+1]; i++ } }
 				'-s2', '--seed2' { if i + 1 < args.len { seed2_str = args[i+1]; i++ } }
-				'-s11', '--seed11' { if i + 1 < args.len { seed11_str = args[i+1]; i++ } }
-				'--capacity' { if i + 1 < args.len { capacity_str = args[i+1]; i++ } }
 				'--mem' { if i + 1 < args.len { mem = args[i+1].u32(); i++ } }
 				'--iter' { if i + 1 < args.len { iter = args[i+1].u32(); i++ } }
 				'--threads' { if i + 1 < args.len { threads = u8(args[i+1].int()); i++ } }
@@ -1934,52 +1880,26 @@ fn main() {
 			}
 		}
 
-		if file_path == '' {
-			println('Error: Input file (-f or --file) is required.')
-			return
+		if password == '' {
+			password = os.input_password('Enter Master Password: ') or { panic(err) }
 		}
-		if !os.exists(file_path) {
-			println('Error: Input file does not exist: ${file_path}')
-			return
+		if seed1_str == '' {
+			seed1_str = os.input_password('Enter Seed 1 (Puzzle Locator Key): ') or { panic(err) }
 		}
-		if mode == 'encrypt' && out_path == '' {
-			println('Error: Output file (-o or --out) is required.')
-			return
+		if seed2_str == '' {
+			seed2_str = os.input_password('Enter Seed 2 (Payload Locator Key): ') or { panic(err) }
 		}
-		if prime_bits < 256 || prime_bits > 4096 {
-			println('Error: Prime bit length must be between 256 and 4096.')
-			return
-		}
-		if lwe_dim < 256 {
-			println('Error: LWE dimension must be at least 256 for security.')
-			return
-		}
-		if threads <= 0 {
-			println('Error: Thread count must be greater than 0.')
-			return
-		}
-		if iter <= 0 {
-			println('Error: Argon2 iterations must be greater than 0.')
-			return
-		}
-		if mem < 1024 {
-			println('Error: Argon2 memory must be at least 1024 KB.')
-			return
-		}
-
-		if password == '' { password = os.input_password('Enter Master Password: ') or { panic(err) } }
-		if seed1_str == '' { seed1_str = os.input_password('Enter Seed 1 (Puzzle Locator Key): ') or { panic(err) } }
-		if seed2_str == '' { seed2_str = os.input_password('Enter Seed 2 (Payload Locator Key): ') or { panic(err) } }
-		if seed11_str == '' { seed11_str = os.input_password('Enter Seed 11 (Volume Locator Key - Plausible Deniability): ') or { panic(err) } }
-
-		capacity := parse_capacity(capacity_str)
 
 		if mode == 'encrypt' {
-			locktime_encrypt_flow(file_path, out_path, duration, password, seed1_str, seed2_str, seed11_str, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig, is_pq, lwe_dim, capacity) or {
+			if is_pq && lwe_dim < 256 {
+				println('Error: LWE dimension must be at least 256 for security.')
+				return
+			}
+			locktime_encrypt_flow(file_path, out_path, duration, password, seed1_str, seed2_str, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig, is_pq, lwe_dim) or {
 				println('[-] Encryption Error: ${err}')
 			}
 		} else if mode == 'decrypt' {
-			locktime_decrypt_flow(file_path, out_path, password, seed1_str, seed2_str, seed11_str, pbkdf2_iter, shred_orig) or {
+			locktime_decrypt_flow(file_path, out_path, password, seed1_str, seed2_str, pbkdf2_iter, shred_orig) or {
 				println('[-] Decryption Error: ${err}')
 			}
 		}
