@@ -6,13 +6,13 @@ Salty is a lightweight, high-performance command-line utility written in V for s
 
 ### 1. Locktime Engine (Sequential Time-Lock Cryptography)
 - **Post-Quantum Default VDF**: By default, Salty utilizes a sequential SHA-512 Hash-Chain to enforce a rigorous time-lock delay. This design is completely immune to Grover's and Shor's algorithms, preventing quantum computers from bypassing the sequential delay.
-- **Lattice-Based Key Encapsulation (LWE-KEM)**: Secures the 256-bit symmetric session key using a lightweight Ring-LWE style Learning with Errors (LWE) post-quantum scheme. The LWE secret is derived dynamically from the solved VDF, adding quantum-resistant hardness to the key wrapping.
+- **Symmetric Post-Quantum Key Encapsulation**: Secures the 256-bit symmetric session key using a highly robust, symmetric post-quantum scheme. A 256-bit key and a 12-byte nonce are derived dynamically from the solved SHA-512 VDF hash solution [1]. The session key is then encrypted using authenticated `ChaCha20-Poly1305` [1]. Since symmetric encryption with 256-bit keys is inherently post-quantum secure (immune to Shor's and retaining 128 bits of security under Grover's search), this provides robust quantum resistance with zero external C dependencies, making it perfectly optimized for limited environments like Termux [1].
 - **Classical RSW96 Fallback (`--classic`)**: Optional fallback mode using sequential modular squarings ($x_{i+1} = x_i^2 \pmod N$) with Pietrzak VDF verification proof. The starting base $a$ is dynamically derived from the Master Password and the file salt ($a = \text{Hash}(\text{MasterPassword} + \text{salt}) \pmod N$) to neutralize offline parallelized brute-force attacks.
 - **Triple-Key Security Model (Oracle-Resistance)**: 
     - **Master Password**: Used for Argon2id derivation and symmetric encryption.
     - **Seed 1 (`-s1`)**: Independent locator key used to shuffle and hide the Time-Lock puzzle blocks.
     - **Seed 2 (`-s2`)**: Independent locator key used to map the encrypted payload.
-    - *Why?* By separating the puzzle location (`Seed 1`) from the Master Password, even if an attacker guesses the password, they cannot instantly verify it. They are forced to solve the Time-Lock puzzle first, making brute-force mathematically impossible.
+    - *Why?* By separating the puzzle location (`Seed 1`) from the Master Password, even if an attacker guesses the password, they cannot instantly verify it. They are forced to solve the Time-Lock puzzle first, making brute-force mathematically impractical.
 - **Native ChaCha20-Poly1305 AEAD**: The entire cryptographic pipeline has been moved in-house using V's native cryptography module (`x.crypto.chacha20poly1305`). This replaces standard OpenSSL binary calls, closing potential OpSec leaks such as arguments visible in process monitors (e.g., `ps aux`).
 - **Hardened Key Derivation**: The header encryption key and the secondary payload seed are strengthened using the user-configured stretching parameter (`pbkdf2_iter` which defaults to 200,000 rounds) instead of weak default iterations.
 - **Forensic Evasion & OpSec**:
@@ -112,7 +112,7 @@ pkg update -y && pkg install -y git clang make zstd && if ! command -v v >/dev/n
 ## Security Model
 **Salty** provides a defense-in-depth architecture:
 1. **Asymmetric Sequential Delay (VDF)**: By default, using a SHA-512 Sequential Hash-Chain VDF forces a mathematical wait-time of $T$ seconds *per password guess* that cannot be bypassed by quantum computers or highly parallelized hardware, rendering offline dictionary attacks computationally impractical.
-2. **Post-Quantum Key Wrapping**: Secures the symmetric session key with a Learning with Errors (LWE) lattice-based key encapsulation mechanism, ensuring metadata confidentiality even under post-quantum scrutiny.
+2. **Post-Quantum Symmetric Key Wrapping**: Secures the symmetric session key by deriving keying material directly from the SHA-512 VDF solution and encrypting it with native, authenticated ChaCha20-Poly1305 [1]. This provides mathematically sound post-quantum protection [1] without relying on complex, non-standard custom LWE parameters or heavy third-party C library compilation.
 3. **Pure-V Cryptographic Pipeline**: By moving all symmetric operations to `x.crypto.chacha20poly1305`, Salty operates completely in-memory, mitigating the risk of command-line password leakage and guaranteeing data authenticity (AEAD) via Poly1305 verification.
 4. **Oracle Resistance**: Decoupling the physical file structure (`Seed 1`) from the Master Password prevents attackers from instantly validating guesses or even locating the encrypted metadata block.
 5. **Stretched Key Derivation**: Replaces low-iteration PBKDF2 layers with configurable high-entropy stretching (default: 200,000 rounds) to further secure the secondary key and seed derivation pipelines.
