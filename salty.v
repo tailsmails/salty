@@ -105,7 +105,7 @@ fn (mut rng SecurePRNG) next_u32() u32 {
 	b1 := rng.next_u8()
 	b2 := rng.next_u8()
 	b3 := rng.next_u8()
-	return (u32(b0) << 24) | (u32(b1) << 16) | (u32(b2) << 8) | u32(b3)
+	return (u32(b0) << 24) | (u32(b1) << 16) | (u32(b2) << 8) | b3
 }
 
 fn (mut rng SecurePRNG) intn(n int) int {
@@ -479,7 +479,7 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 						use_swap = true
 					} else {
 						use_swap = rng.intn(2) == 0
-					}
+				}
 				}
 				if use_swap && ref_idx < ref_runes.len - 1 && ref_runes[ref_idx] != ref_runes[ref_idx+1] {
 					if i < modified_runes.len - 1 {
@@ -778,6 +778,18 @@ fn read_u64(b []u8, offset int) u64 {
 	return val
 }
 
+fn write_u64_to_buf(mut b []u8, val u64, offset int) {
+	for b.len < offset + 8 { b << 0 }
+	b[offset]     = u8(val >> 56)
+	b[offset + 1] = u8(val >> 48)
+	b[offset + 2] = u8(val >> 40)
+	b[offset + 3] = u8(val >> 32)
+	b[offset + 4] = u8(val >> 24)
+	b[offset + 5] = u8(val >> 16)
+	b[offset + 6] = u8(val >> 8)
+	b[offset + 7] = u8(val)
+}
+
 fn zeroize(mut b []u8) {
 	if b.len == 0 { return }
 	unsafe {
@@ -887,8 +899,10 @@ fn is_prime_mr(n big.Integer, k int) !bool {
 	return true
 }
 
-fn generate_prime(bits int) !big.Integer {
+fn generate_safe_prime(bits int) !big.Integer {
 	mut rng := new_secure_prng()!
+	one := big.integer_from_int(1)
+	two := big.integer_from_int(2)
 	for {
 		mut bytes := []u8{len: bits / 8}
 		for i in 0 .. bytes.len {
@@ -897,11 +911,20 @@ fn generate_prime(bits int) !big.Integer {
 		bytes[0] |= 0x80
 		bytes[bytes.len - 1] |= 0x01
 		hex_str := bytes.hex()
-		num := big.integer_from_radix(hex_str, 16) or { continue }
-		if is_obviously_composite(num) { continue }
-		if is_prime_mr(num, 8)! {
-			return num
+		mut p := big.integer_from_radix(hex_str, 16) or { continue }
+		
+		if p % two == big.integer_from_int(0) {
+			p = p + one
 		}
+		
+		if is_obviously_composite(p) { continue }
+		p_prime := (p - one) / two
+		if is_obviously_composite(p_prime) { continue }
+		
+		if !is_prime_mr(p_prime, 6)! { continue }
+		if !is_prime_mr(p, 6)! { continue }
+		
+		return p
 	}
 	return big.integer_from_int(0)
 }
@@ -1150,16 +1173,49 @@ fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) 
 	}
 }
 
+fn encrypt_chunk(chunk_data []u8, key []u8, iv []u8, chunk_index u64, use_compression bool) ![]u8 {
+	mut data := chunk_data.clone()
+	if use_compression {
+		data = gzip.compress(data)!
+	}
+	mut chunk_nonce := []u8{len: 12, init: 0}
+	for i in 0 .. 4 { chunk_nonce[i] = iv[i] }
+	write_u64_to_buf(mut chunk_nonce, chunk_index, 4)
+	return chacha20poly1305.encrypt(data, key, chunk_nonce, []u8{})!
+}
+
+fn decrypt_chunk(cipher_bytes []u8, key []u8, iv []u8, chunk_index u64, use_compression bool) ![]u8 {
+	mut chunk_nonce := []u8{len: 12, init: 0}
+	for i in 0 .. 4 { chunk_nonce[i] = iv[i] }
+	write_u64_to_buf(mut chunk_nonce, chunk_index, 4)
+	mut decrypted := chacha20poly1305.decrypt(cipher_bytes, key, chunk_nonce, []u8{}) or {
+		return error('Chunk decryption failed')
+	}
+	if use_compression {
+		decrypted = gzip.decompress(decrypted)!
+	}
+	return decrypted
+}
+
 fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1_str string, seed2_str string, mem u32, iter u32, threads u8, prime_bits int, pbkdf2_iter int, shred_orig bool, is_pq bool, use_compression bool) ! {
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') }
 	if prime_bits < 256 || prime_bits > 4096 {
 		return error('Prime bit length must be between 256 and 4096.')
 	}
+	
+	mut infile := os.open(file_path)!
+	defer { infile.close() }
+	mut outfile := os.create(out_path)!
+	defer { outfile.close() }
+	
 	file_salt := secure_random_bytes(32)!
+	outfile.write(file_salt)!
+	
 	mut n := big.integer_from_int(0)
 	mut t_val := u64(0)
 	mut w_trapdoor_bytes := []u8{}
 	mut proof := []big.Integer{}
+	
 	if is_pq {
 		steps_per_ms := run_pq_calibration()
 		t_val = duration_sec * steps_per_ms * 1000
@@ -1171,10 +1227,10 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		}
 		w_trapdoor_bytes = x[0..32].clone()
 	} else {
-		println('[*] Generating dynamic prime \$p (${prime_bits} bits)...')
-		p := generate_prime(prime_bits)!
-		println('[*] Generating dynamic prime \$q (${prime_bits} bits)...')
-		q := generate_prime(prime_bits)!
+		println('[*] Generating dynamic safe prime \$p (${prime_bits} bits)...')
+		p := generate_safe_prime(prime_bits)!
+		println('[*] Generating dynamic safe prime \$q (${prime_bits} bits)...')
+		q := generate_safe_prime(prime_bits)!
 		n = p * q
 		one := big.integer_from_int(1)
 		phi_n := (p - one) * (q - one)
@@ -1202,6 +1258,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		println('[*] Generating Pietrzak VDF verification proof...')
 		pietrzak_prove(a, w_trapdoor, t_val, n, mut proof)!
 	}
+	
 	session_key := secure_random_bytes(32)!
 	session_iv := secure_random_bytes(16)!
 	println('[*] Deriving independent Seed 1 (Puzzle Locator)...')
@@ -1211,17 +1268,24 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	header_key_iv := pbkdf2_sha3_512(password.bytes(), file_salt, pbkdf2_iter, 48)
 	header_key := header_key_iv[0..32].hex()
 	header_iv := header_key_iv[32..48].hex()
-	println('[*] Compressing and running internal ChaCha20-Poly1305 AEAD...')
-	mut file_bytes := os.read_bytes(file_path)!
-	if use_compression {
-		file_bytes = gzip.compress(file_bytes)!
+	
+	chunk_size := 1024 * 1024
+	mut first_chunk_buf := []u8{len: chunk_size}
+	n_read := infile.read(mut first_chunk_buf) or { 0 }
+	mut first_chunk_raw := []u8{}
+	if n_read > 0 {
+		first_chunk_raw = first_chunk_buf[0..n_read].clone()
 	}
-	cipher_bytes := chacha20poly1305.encrypt(file_bytes, session_key, session_iv[0..12], []u8{})!
+	
+	println('[*] Compressing and encrypting first chunk...')
+	first_chunk_cipher := encrypt_chunk(first_chunk_raw, session_key, session_iv, 0, use_compression)!
+	
 	mut key_ciphertext := []u8{}
 	mut salt := []u8{len: 16}
 	mut iter_val := iter
 	mut mem_val := mem
 	mut threads_val := threads
+	
 	if is_pq {
 		s := sha3.sum512(w_trapdoor_bytes)
 		pq_key := s[0..32].clone()
@@ -1247,16 +1311,19 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		for byte in session_iv { session_key_iv << byte }
 		key_ciphertext = xor_bytes(session_key_iv, final_key_bytes)
 	}
+	
 	vdf_params := serialize_vdf_params(n, t_val, is_pq)
-	header_raw := serialize_header(salt, iter_val, mem_val, threads_val, u32(cipher_bytes.len), proof, key_ciphertext)
+	header_raw := serialize_header(salt, iter_val, mem_val, threads_val, u32(first_chunk_cipher.len), proof, key_ciphertext)
 	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
+	
 	mut meta := []u8{}
 	write_u16(mut meta, u16(vdf_params.len))
 	write_u32(mut meta, u32(encrypted_header.len))
 	for b in vdf_params { meta << b }
 	for b in encrypted_header { meta << b }
-	println('[*] Performing decoupled double-seed byte-level interleaving (No trial-leak)...')
-	data_len := meta.len + cipher_bytes.len
+	
+	println('[*] Performing decoupled double-seed byte-level interleaving on header + first chunk...')
+	data_len := meta.len + first_chunk_cipher.len
 	total_len := data_len * 2
 	mut mixed := []u8{len: total_len}
 	mut mixed_seed := []u8{cap: 128}
@@ -1266,6 +1333,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	for i in 0 .. total_len {
 		mixed[i] = u8(junk_rng.next_u8() & 0xFF)
 	}
+	
 	mut all_indices := []int{len: total_len}
 	for i in 0 .. total_len { all_indices[i] = i }
 	mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
@@ -1273,6 +1341,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		j := shuffle_rng1.intn(i + 1)
 		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
 	}
+	
 	meta_len := meta.len
 	mut meta_indices := []int{cap: meta_len}
 	for i in 0 .. meta_len {
@@ -1281,6 +1350,7 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	for i in 0 .. meta_len {
 		mixed[meta_indices[i]] = meta[i]
 	}
+	
 	mut remaining_indices := []int{cap: total_len - meta_len}
 	for i in meta_len .. total_len {
 		remaining_indices << all_indices[i]
@@ -1290,13 +1360,34 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 		j := shuffle_rng2.intn(i + 1)
 		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
 	}
-	for i in 0 .. cipher_bytes.len {
-		mixed[remaining_indices[i]] = cipher_bytes[i]
+	for i in 0 .. first_chunk_cipher.len {
+		mixed[remaining_indices[i]] = first_chunk_cipher[i]
 	}
-	mut final_output := []u8{cap: file_salt.len + mixed.len}
-	for b in file_salt { final_output << b }
-	for b in mixed { final_output << b }
-	os.write_bytes(out_path, final_output)!
+	
+	mut mixed_size_buf := []u8{}
+	write_u32(mut mixed_size_buf, u32(mixed.len))
+	outfile.write(mixed_size_buf)!
+	outfile.write(mixed)!
+	
+	println('[*] Encrypting and streaming subsequent chunks...')
+	mut chunk_index := u64(1)
+	mut buf := []u8{len: chunk_size}
+	for {
+		n_chunk := infile.read(mut buf) or { 0 }
+		if n_chunk <= 0 { break }
+		chunk_data := buf[0..n_chunk].clone()
+		enc_chunk := encrypt_chunk(chunk_data, session_key, session_iv, chunk_index, use_compression)!
+		
+		mut len_buf := []u8{}
+		write_u32(mut len_buf, u32(enc_chunk.len))
+		outfile.write(len_buf)!
+		outfile.write(enc_chunk)!
+		chunk_index++
+	}
+	
+	infile.close()
+	outfile.close()
+	
 	println('[+] Homogeneous binary file successfully saved to: ${out_path}')
 	if shred_orig {
 		println('[*] Securely shredding original input file: ${file_path} ...')
@@ -1309,13 +1400,32 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	if os.exists(out_path) {
 		os.rm(out_path) or {}
 	}
+	
+	mut infile := os.open(file_path)!
+	defer { infile.close() }
+	mut outfile := os.create(out_path)!
+	defer { outfile.close() }
+	
 	println('[*] Reading homogeneous raw binary file...')
-	file_bytes := os.read_bytes(file_path)!
-	if file_bytes.len < 75 {
-		return error('File is too small to contain valid metadata!')
+	mut file_salt := []u8{len: 32}
+	n_salt := infile.read(mut file_salt)!
+	if n_salt < 32 {
+		return error('File is too small to contain a valid salt!')
 	}
-	file_salt := file_bytes[0..32].clone()
-	mixed := file_bytes[32..].clone()
+	
+	mut mixed_size_buf := []u8{len: 4}
+	n_size := infile.read(mut mixed_size_buf)!
+	if n_size < 4 {
+		return error('File is too small to contain mixed size!')
+	}
+	mixed_len := read_u32(mixed_size_buf, 0)
+	
+	mut mixed := []u8{len: int(mixed_len)}
+	n_mixed := infile.read(mut mixed)!
+	if n_mixed < int(mixed_len) {
+		return error('Failed to read the complete interleaved block!')
+	}
+	
 	total_len := mixed.len
 	seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
 	mut all_indices := []int{len: total_len}
@@ -1325,12 +1435,14 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		j := shuffle_rng1.intn(i + 1)
 		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
 	}
+	
 	mut meta_prefix := []u8{len: 6}
 	for i in 0 .. 6 {
 		meta_prefix[i] = mixed[all_indices[i]]
 	}
 	vdf_len := read_u16(meta_prefix, 0)
 	enc_header_len := read_u32(meta_prefix, 2)
+	
 	mut safe_vdf_len := int(vdf_len)
 	mut safe_enc_header_len := int(enc_header_len)
 	mut rem_space := total_len - 6
@@ -1340,6 +1452,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		safe_enc_header_len = rem_space - safe_vdf_len
 	}
 	meta_total_len := 6 + safe_vdf_len + safe_enc_header_len
+	
 	mut vdf_bytes := []u8{len: safe_vdf_len}
 	for i in 0 .. safe_vdf_len {
 		idx := 6 + i
@@ -1354,6 +1467,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 			enc_header_bytes[i] = mixed[all_indices[idx]]
 		}
 	}
+	
 	n_dummy := generate_dynamic_dummy_params(password, file_salt, 1024)
 	vdf_p := deserialize_vdf_params(vdf_bytes) or {
 		VdfParams{ n: n_dummy, t: u64(100000), is_pq: true }
@@ -1366,6 +1480,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	if t_val < 1 || t_val > 50000000 {
 		t_val = 100000
 	}
+	
 	mut x_bytes := []u8{}
 	if vdf_p.is_pq {
 		println('[*] Resolving post-quantum SHA-3-512 time-lock puzzle sequentially (t = ${t_val}). Please wait...')
@@ -1403,6 +1518,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		x_bytes = x.str().bytes().clone()
 		println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
 	}
+	
 	header_key_iv := pbkdf2_sha3_512(password.bytes(), file_salt, pbkdf2_iter, 48)
 	header_key := header_key_iv[0..32].hex()
 	header_iv := header_key_iv[32..48].hex()
@@ -1419,6 +1535,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 			key_ciphertext: []u8{}
 		}
 	}
+	
 	mut cipher_len := header.cipher_len
 	mut remaining_indices := []int{cap: if total_len > meta_total_len { total_len - meta_total_len } else { 0 }}
 	if total_len > meta_total_len {
@@ -1431,6 +1548,7 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	if safe_cipher_len <= 0 || safe_cipher_len > max_cipher {
 		safe_cipher_len = max_cipher
 	}
+	
 	mut session_key := []u8{}
 	mut session_iv := []u8{}
 	if vdf_p.is_pq {
@@ -1474,34 +1592,52 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		session_key = dec_key_iv[0..32].clone()
 		session_iv = dec_key_iv[32..48].clone()
 	}
+	
 	seed_bytes2 := derive_seed2(seed2_str, x_bytes, pbkdf2_iter) or { []u8{len: 64} }
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
 	for i := remaining_indices.len - 1; i > 0; i-- {
 		j := shuffle_rng2.intn(i + 1)
 		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
 	}
-	mut cipher_bytes := []u8{len: safe_cipher_len}
+	
+	mut first_chunk_cipher := []u8{len: safe_cipher_len}
 	for i in 0 .. safe_cipher_len {
 		if i >= 0 && i < remaining_indices.len {
 			idx := remaining_indices[i]
 			if idx >= 0 && idx < mixed.len {
-				cipher_bytes[i] = mixed[idx]
+				first_chunk_cipher[i] = mixed[idx]
 			}
 		}
 	}
-	println('[*] Running internal ChaCha20-Poly1305 decryption and decompression...')
-	decompressed_bytes := chacha20poly1305.decrypt(cipher_bytes, session_key, session_iv[0..12], []u8{}) or {
-		if os.exists(out_path) { os.rm(out_path) or {} }
-		return error('File decryption failed. Data corrupted or wrong parameters.')
+	
+	println('[*] Running first chunk decryption and decompression...')
+	first_chunk_raw := decrypt_chunk(first_chunk_cipher, session_key, session_iv, 0, use_compression) or {
+		return error('First chunk decryption failed. Data corrupted or wrong parameters.')
 	}
-	mut final_bytes := decompressed_bytes.clone()
-	if use_compression {
-		final_bytes = gzip.decompress(decompressed_bytes) or {
-			if os.exists(out_path) { os.rm(out_path) or {} }
-			return error('Decompression failed.')
+	outfile.write(first_chunk_raw)!
+	
+	println('[*] Decrypting and streaming subsequent chunks...')
+	mut chunk_index := u64(1)
+	for {
+		mut chunk_len_buf := []u8{len: 4}
+		n_len := infile.read(mut chunk_len_buf) or { 0 }
+		if n_len < 4 { break }
+		enc_len := read_u32(chunk_len_buf, 0)
+		
+		mut enc_chunk := []u8{len: int(enc_len)}
+		n_chunk := infile.read(mut enc_chunk)!
+		if n_chunk < int(enc_len) {
+			return error('Malformed file: truncated chunk ciphertext!')
 		}
+		
+		dec_chunk := decrypt_chunk(enc_chunk, session_key, session_iv, chunk_index, use_compression)!
+		outfile.write(dec_chunk)!
+		chunk_index++
 	}
-	os.write_bytes(out_path, final_bytes)!
+	
+	infile.close()
+	outfile.close()
+	
 	println('[+] Decrypted file successfully saved to: ${out_path}')
 	if shred_orig {
 		println('[*] Securely shredding encrypted carrier file: ${file_path} ...')
