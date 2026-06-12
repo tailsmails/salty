@@ -7,6 +7,7 @@ import crypto.sha512
 import crypto.pbkdf2
 import crypto.rand as crand
 import time
+import x.crypto.chacha20poly1305
 
 struct SecurePRNG {
 mut:
@@ -193,7 +194,7 @@ fn openssl_encrypt(plaintext string, password string) !string {
 	os.chmod(temp_dir, 0o700) or {}
 	
 	tmp_plain := os.join_path(temp_dir, 'plain.txt')
-	tmp_enc := os.join_path(temp_dir, 'enc.bin')
+	tmp_comp := os.join_path(temp_dir, 'comp.zst')
 
 	os.write_file(tmp_plain, plaintext)!
 	
@@ -202,23 +203,45 @@ fn openssl_encrypt(plaintext string, password string) !string {
 		os.rmdir_all(temp_dir) or {}
 	}
 
-	os.setenv('SALTY_PASS', password, true)
-	defer { os.setenv('SALTY_PASS', '', true) }
+	zstd_cmd := 'zstd -19 -q -f ${os.quoted_path(tmp_plain)} -o ${os.quoted_path(tmp_comp)}'
+	res := os.execute(zstd_cmd)
+	if res.exit_code != 0 { return error('ZSTD compression failed') }
+	
+	comp_bytes := os.read_bytes(tmp_comp)!
 
-	openssl_cmd := 'zstd -19 -c -q -f ${os.quoted_path(tmp_plain)} | openssl enc -chacha20 -pass env:SALTY_PASS -pbkdf2 -iter 10000 -out ${os.quoted_path(tmp_enc)}'
-	res := os.execute(openssl_cmd)
-
-	if res.exit_code != 0 { return error('OpenSSL failed') }
-	enc_bytes := os.read_bytes(tmp_enc)!
-	return enc_bytes.hex()
+	salt := secure_random_bytes(16)!
+	key := pbkdf2.key(password.bytes(), salt, 10000, 32, sha512.new())!
+	nonce := secure_random_bytes(12)!
+	
+	encrypted := chacha20poly1305.encrypt(comp_bytes, key, nonce, []u8{})!
+	
+	mut final_bytes := []u8{cap: salt.len + nonce.len + encrypted.len}
+	final_bytes << salt
+	final_bytes << nonce
+	final_bytes << encrypted
+	
+	return final_bytes.hex()
 }
 
 fn openssl_decrypt(hex_ciphertext string, password string) !string {
+	raw_data := hex_to_bytes(hex_ciphertext)!
+	if raw_data.len < 16 + 12 { return error('Ciphertext too short or corrupted') }
+	
+	salt := raw_data[0..16]
+	nonce := raw_data[16..28]
+	encrypted := raw_data[28..]
+	
+	key := pbkdf2.key(password.bytes(), salt, 10000, 32, sha512.new())!
+	
+	comp_bytes := chacha20poly1305.decrypt(encrypted, key, nonce, []u8{}) or {
+		return error('Decryption failed (Wrong password or tampered data)')
+	}
+
 	temp_dir := os.join_path(os.temp_dir(), 'st_dec_${os.getpid()}')
 	os.mkdir(temp_dir)!
 	os.chmod(temp_dir, 0o700) or {}
 	
-	tmp_enc := os.join_path(temp_dir, 'enc.bin')
+	tmp_comp := os.join_path(temp_dir, 'comp.zst')
 	tmp_plain := os.join_path(temp_dir, 'plain.txt')
 
 	defer {
@@ -226,19 +249,14 @@ fn openssl_decrypt(hex_ciphertext string, password string) !string {
 		os.rmdir_all(temp_dir) or {}
 	}
 
-	enc_bytes := hex_to_bytes(hex_ciphertext)!
-	os.write_bytes(tmp_enc, enc_bytes)!
+	os.write_bytes(tmp_comp, comp_bytes)!
 
-	os.setenv('SALTY_PASS', password, true)
-	defer { os.setenv('SALTY_PASS', '', true) }
+	zstd_cmd := 'zstd -d -q -f ${os.quoted_path(tmp_comp)} -o ${os.quoted_path(tmp_plain)}'
+	res := os.execute(zstd_cmd)
 
-	openssl_cmd := 'openssl enc -chacha20 -d -pass env:SALTY_PASS -pbkdf2 -iter 10000 -in ${os.quoted_path(tmp_enc)} | zstd -d -q -f - -o ${os.quoted_path(tmp_plain)}'
-	res := os.execute(openssl_cmd)
+	if res.exit_code != 0 { return error('ZSTD decompression failed') }
 
-	if res.exit_code != 0 { return error('OpenSSL decryption failed (Wrong password?)') }
-
-	plaintext := os.read_file(tmp_plain)!
-	return plaintext
+	return os.read_file(tmp_plain)!
 }
 
 fn get_english_qwerty_neighbors(c rune) []rune {
@@ -1130,39 +1148,19 @@ fn deserialize_header(b []u8) !DecryptedHeader {
 }
 
 fn openssl_encrypt_header(header_bytes []u8, key_hex string, iv_hex string) ![]u8 {
-	temp_dir := os.join_path(os.temp_dir(), 'lt_hdr_enc_${os.getpid()}')
-	os.mkdir(temp_dir)!
-	defer { os.rmdir_all(temp_dir) or {} }
-
-	tmp_in := os.join_path(temp_dir, 'in.bin')
-	tmp_out := os.join_path(temp_dir, 'out.bin')
-
-	os.write_bytes(tmp_in, header_bytes)!
-	defer { secure_shred_file(tmp_in) }
-
-	cmd := 'openssl enc -chacha20 -e -K ${key_hex} -iv ${iv_hex} -in ${os.quoted_path(tmp_in)} -out ${os.quoted_path(tmp_out)}'
-	res := os.execute(cmd)
-	if res.exit_code != 0 { return error('Header encryption pipeline failed') }
-
-	return os.read_bytes(tmp_out)!
+	key := hex_to_bytes(key_hex)!
+	iv := hex_to_bytes(iv_hex)!
+	nonce := iv[0..12]
+	return chacha20poly1305.encrypt(header_bytes, key, nonce, []u8{})!
 }
 
 fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) ![]u8 {
-	temp_dir := os.join_path(os.temp_dir(), 'lt_hdr_dec_${os.getpid()}')
-	os.mkdir(temp_dir)!
-	defer { os.rmdir_all(temp_dir) or {} }
-
-	tmp_in := os.join_path(temp_dir, 'in.bin')
-	tmp_out := os.join_path(temp_dir, 'out.bin')
-
-	os.write_bytes(tmp_in, enc_header_bytes)!
-	defer { secure_shred_file(tmp_in) }
-
-	cmd := 'openssl enc -chacha20 -d -K ${key_hex} -iv ${iv_hex} -in ${os.quoted_path(tmp_in)} -out ${os.quoted_path(tmp_out)}'
-	res := os.execute(cmd)
-	if res.exit_code != 0 { return error('Header decryption pipeline failed') }
-
-	return os.read_bytes(tmp_out)!
+	key := hex_to_bytes(key_hex)!
+	iv := hex_to_bytes(iv_hex)!
+	nonce := iv[0..12]
+	return chacha20poly1305.decrypt(enc_header_bytes, key, nonce, []u8{}) or {
+		return error('Header decryption failed (tampered or wrong key)')
+	}
 }
 
 fn lwe_encrypt(data []u8, base_secret []u8, dim int, mut rng SecurePRNG) []u8 {
@@ -1303,9 +1301,6 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	session_key := secure_random_bytes(32)!
 	session_iv := secure_random_bytes(16)!
 
-	key_hex := session_key.hex()
-	iv_hex := session_iv.hex()
-
 	println('[*] Deriving independent Seed 1 (Puzzle Locator)...')
 	seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
 
@@ -1321,14 +1316,15 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	os.chmod(temp_dir, 0o700) or {}
 	defer { os.rmdir_all(temp_dir) or {} }
 
-	tmp_cipher_file := os.join_path(temp_dir, 'lt_tmp.bin')
-
-	println('[*] Running OpenSSL ChaCha20 encryption engine with inline ZSTD compression...')
-	openssl_cmd := 'zstd -19 -c -q -f ${os.quoted_path(file_path)} | openssl enc -chacha20 -e -K ${key_hex} -iv ${iv_hex} -out ${os.quoted_path(tmp_cipher_file)}'
-	res := os.execute(openssl_cmd)
-	if res.exit_code != 0 { return error('OpenSSL pipeline execution failed. Ensure zstd and openssl are installed.') }
-
-	cipher_bytes := os.read_bytes(tmp_cipher_file)!
+	println('[*] Compressing with ZSTD and running internal ChaCha20-Poly1305 AEAD...')
+	tmp_comp_file := os.join_path(temp_dir, 'lt_comp.zst')
+	zstd_cmd := 'zstd -19 -q -f ${os.quoted_path(file_path)} -o ${os.quoted_path(tmp_comp_file)}'
+	res := os.execute(zstd_cmd)
+	if res.exit_code != 0 { return error('ZSTD compression failed.') }
+	
+	compressed_file_bytes := os.read_bytes(tmp_comp_file)!
+	
+	cipher_bytes := chacha20poly1305.encrypt(compressed_file_bytes, session_key, session_iv[0..12], []u8{})!
 
 	mut lwe_ciphertext := []u8{}
 	mut salt := []u8{len: 16}
@@ -1640,26 +1636,27 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 		}
 	}
 
-	key_hex := session_key.hex()
-	iv_hex := session_iv.hex()
-
 	temp_dir := os.join_path(os.temp_dir(), 'lt_dec_${os.getpid()}')
 	os.mkdir(temp_dir)!
 	os.chmod(temp_dir, 0o700) or {}
 	defer { os.rmdir_all(temp_dir) or {} }
 
-	tmp_cipher_file := os.join_path(temp_dir, 'lt_dec_tmp.bin')
-	os.write_bytes(tmp_cipher_file, cipher_bytes)!
+	println('[*] Running internal ChaCha20-Poly1305 decryption and ZSTD decompression...')
+	
+	decompressed_bytes := chacha20poly1305.decrypt(cipher_bytes, session_key, session_iv[0..12], []u8{}) or {
+		if os.exists(out_path) { os.rm(out_path) or {} }
+		return error('File decryption failed. Data corrupted or wrong parameters.')
+	}
 
-	println('[*] Running OpenSSL ChaCha20 decryption engine and decompressing...')
-	pipeline_cmd := 'openssl enc -chacha20 -d -K ${key_hex} -iv ${iv_hex} -in ${os.quoted_path(tmp_cipher_file)} | zstd -d -q -f - -o ${os.quoted_path(out_path)}'
-	res := os.execute(pipeline_cmd)
+	tmp_comp_file := os.join_path(temp_dir, 'lt_comp.zst')
+	os.write_bytes(tmp_comp_file, decompressed_bytes)!
 
+	zstd_cmd := 'zstd -d -q -f ${os.quoted_path(tmp_comp_file)} -o ${os.quoted_path(out_path)}'
+	res := os.execute(zstd_cmd)
+	
 	if res.exit_code != 0 {
-		if os.exists(out_path) {
-			os.rm(out_path) or {}
-		}
-		return error('Decryption or decompression failed. Data corruption or invalid parameters.')
+		if os.exists(out_path) { os.rm(out_path) or {} }
+		return error('ZSTD decompression failed.')
 	}
 
 	println('[+] Decrypted file successfully saved to: ${out_path}')
