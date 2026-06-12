@@ -1091,21 +1091,6 @@ fn derive_seed2(seed_str string, w_bytes []u8, iter int) ![]u8 {
 	return derived.clone()
 }
 
-fn generate_dynamic_dummy_params(password string, file_salt []u8, bits int) big.Integer {
-	mut data := []u8{cap: password.len + file_salt.len}
-	for b in password.bytes() { data << b }
-	for b in file_salt { data << b }
-	seed := sha3.sum512(data)
-	mut rng := SecurePRNG{seed: seed}
-	mut bytes := []u8{len: bits / 8}
-	for i in 0 .. bytes.len {
-		bytes[i] = rng.next_u8()
-	}
-	bytes[0] |= 0x80
-	bytes[bytes.len - 1] |= 0x01
-	return big.integer_from_radix(bytes.hex(), 16) or { big.integer_from_int(3) }
-}
-
 struct VdfParams {
 	n     big.Integer
 	t     u64
