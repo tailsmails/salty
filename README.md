@@ -1,16 +1,11 @@
 # Salty
 
-Salty is a lightweight, high-performance command-line utility written in V for secure data encryption, deep compression, time-locked cryptography, and advanced multi-layered evasion. It provides three distinct core engines: **Locktime** (Time-locked file encryption with plausible deniability), **Salty Steganography** (Data hiding in text/numbers), and **Adversarial Obfuscation** (AI-blinding visual twins).
+Salty is a lightweight, high-performance command-line utility written in V for secure data encryption, deep compression, time-locked cryptography, and advanced multi-layered evasion. It provides three distinct core engines: **Locktime** (Time-locked file encryption), **Salty Steganography** (Data hiding in text/numbers), and **Adversarial Obfuscation** (AI-blinding visual twins).
 
 ## Features
 
-### 1. Locktime Engine (Sequential Time-Lock Cryptography & Hidden Volumes)
-- **Plausible Deniability Slot Engine (90% Noise, 10% Data)**: By default, Salty generates a homogeneous container divided into 10 identical slots. The active payload occupies a single slot (~10% of total volume), while the other 9 slots (~90% of total volume) are pre-filled with high-entropy, deterministic pseudo-random noise. 
-- **Seamless Hidden Volume Injection**: If you encrypt a new file pointing to an existing Salty container, the engine automatically enters **Injection Mode**. It scans the container, compares current bytes against the expected pseudo-random noise stream, identifies empty slots, and embeds the new encrypted payload without changing the total size of the file.
-- **Volume Locator Seed 11 (`-s11`)**: A third independent, master seed used to shuffle the 10 slots and identify where a specific volume resides. Each distinct `Seed 11` maps to a completely different slot sequence. This seed is dynamically stretched using PBKDF2-HMAC-SHA512 to prevent brute-force recovery.
-- **Zero-Magic Indistinguishability**: To ensure absolute plausible deniability, Salty contains no static header magic bytes or recognizable signatures (such as "SALT"). Volume identification during slot scans is achieved through strict structural sanity checks (`is_sane_header`) on the parsed metadata parameters (Argon2 iterations, memory, threads, and LWE dimensions). Unopened slots remain forensically indistinguishable from random bytes.
-- **Custom Sizing Capacity (`--capacity`)**: Users can specify the maximum slot size (e.g., `--capacity 500K`, `--capacity 2M`) during container initialization. This guarantees that future hidden volume injections can accommodate larger files up to that limit.
-- **Post-Quantum Default VDF**: Salty utilizes a sequential SHA-512 Hash-Chain to enforce a rigorous time-lock delay. This design is completely immune to Grover's and Shor's algorithms, preventing quantum computers from bypassing the sequential delay.
+### 1. Locktime Engine (Sequential Time-Lock Cryptography)
+- **Post-Quantum Default VDF**: By default, Salty utilizes a sequential SHA-512 Hash-Chain to enforce a rigorous time-lock delay. This design is completely immune to Grover's and Shor's algorithms, preventing quantum computers from bypassing the sequential delay.
 - **Lattice-Based Key Encapsulation (LWE-KEM)**: Secures the 256-bit symmetric session key using a lightweight Ring-LWE style Learning with Errors (LWE) post-quantum scheme. The LWE secret is derived dynamically from the solved VDF, adding quantum-resistant hardness to the key wrapping.
 - **Classical RSW96 Fallback (`--classic`)**: Optional fallback mode using sequential modular squarings ($x_{i+1} = x_i^2 \pmod N$) with Pietrzak VDF verification proof. The starting base $a$ is dynamically derived from the Master Password and the file salt ($a = \text{Hash}(\text{MasterPassword} + \text{salt}) \pmod N$) to neutralize offline parallelized brute-force attacks.
 - **Triple-Key Security Model (Oracle-Resistance)**: 
@@ -47,28 +42,20 @@ pkg update -y && pkg install -y git clang make openssl zstd && if ! command -v v
 
 ## Usage
 
-### 1. Locktime Mode (Time-Lock Encryption & Hidden Volumes)
-
-**Step 1: Initialize Container with File 1 (Allocating 1MB max per slot):**
+### 1. Locktime Mode (Time-Lock Encryption)
+**Encryption (PQ default, 10s lock, Shred Original):**
 ```bash
-./salty encrypt -f file1.txt -o plnt1 -t 10 -p "MasterPass" -s1 "Key1" -s2 "Key2" -s11 "VolKey1" --capacity 1M
-```
-*Creates a 10MB container `plnt1` (10 slots x 1MB), places `file1.txt` into one slot, and fills the other 9 slots with deterministic pseudo-random noise.*
-
-**Step 2: Inject File 2 (Hidden Volume) into the same Container without changing its size:**
-```bash
-./salty encrypt -f file2.jpg -o plnt1 -t 10 -p "MasterPass" -s1 "Key3" -s2 "Key4" -s11 "VolKey2"
-```
-*Salty scans `plnt1`, detects the vacant slots, and writes `file2.jpg` to a separate slot. The file size of `plnt1` remains exactly 10MB.*
-
-**Step 3: Decrypt Volume 1:**
-```bash
-./salty decrypt -f plnt1 -o decrypted_file1.txt -p "MasterPass" -s1 "Key1" -s2 "Key2" -s11 "VolKey1"
+./salty encrypt -f secret.txt -o locked_file -t 10 -p "MasterPass" -s1 "Key1" -s2 "Key2" -sh
 ```
 
-**Step 4: Decrypt Volume 2:**
+**Encryption in Classical Mode (reverts to RSW96/Pietrzak VDF, 1024-bit Modulus):**
 ```bash
-./salty decrypt -f plnt1 -o decrypted_file2.jpg -p "MasterPass" -s1 "Key3" -s2 "Key4" -s11 "VolKey2"
+./salty encrypt -f secret.txt -o locked_file -t 10 -p "MasterPass" -s1 "Key1" -s2 "Key2" --classic -sh
+```
+
+**Decryption (Sequential Solving - Automatically Detects PQ or Classical Mode):**
+```bash
+./salty decrypt -f locked_file -o restored.txt -p "MasterPass" -s1 "Key1" -s2 "Key2"
 ```
 
 ### 2. Salty Mode: Numeric Obfuscation (Fake Numbers)
@@ -101,12 +88,10 @@ pkg update -y && pkg install -y git clang make openssl zstd && if ! command -v v
 | Flag | Long Flag | Purpose | Engine |
 | :--- | :--- | :--- | :--- |
 | `-f` | `--file` | Input file path | Locktime |
-| `-o` | `--out` | Output file path (or target container for volume injections) | Locktime / Salty |
+| `-o` | `--out` | Output file path | Locktime / Salty |
 | `-t` | `--time` | Time-lock duration in seconds | Locktime |
 | `-s1`| `--seed1`| **Puzzle Locator Key** (Oracle Prevention) | Locktime |
 | `-s2`| `--seed2`| **Payload Locator Key** | Locktime |
-| `-s11`|`--seed11`| **Volume Locator Seed** (Identifies the hidden slot; stretched via PBKDF2) | Locktime |
-| `--capacity`| — | Custom slot size capacity for future injections (e.g., `500K`, `2M`) | Locktime |
 | `-sh`| `--shred` | Securely wipe original file after success | Locktime |
 | `--prime`| — | Prime size (Default: 512, yields 1024-bit N) | Locktime |
 | `--classic`| — | Disable default PQ VDF mode (reverts to RSW96/Pietrzak VDF) | Locktime |
@@ -127,12 +112,11 @@ pkg update -y && pkg install -y git clang make openssl zstd && if ! command -v v
 **Salty** provides a defense-in-depth architecture:
 1. **Asymmetric Sequential Delay (VDF)**: By default, using a SHA-512 Sequential Hash-Chain VDF forces a mathematical wait-time of $T$ seconds *per password guess* that cannot be bypassed by quantum computers or highly parallelized hardware, rendering offline dictionary attacks computationally impractical.
 2. **Post-Quantum Key Wrapping**: Secures the symmetric session key with a Learning with Errors (LWE) lattice-based key encapsulation mechanism, ensuring metadata confidentiality even under post-quantum scrutiny.
-3. **Plausible Deniability & Zero Magic Signatures**: By hiding metadata parameters behind high-entropy encryption keys and eliminating any static magic bytes, Salty achieves complete deniability. Since untouched slots match the PRNG noise perfectly and occupied slots are validated mathematically rather than via signatures, an adversary cannot prove whether a slot contains a hidden volume or random noise.
-4. **Oracle Resistance**: Decoupling the physical file structure (`Seed 1`) from the Master Password prevents attackers from instantly validating guesses or even locating the encrypted metadata block.
-5. **Stretched Key Derivation**: Replaces low-iteration PBKDF2 layers with configurable high-entropy stretching (default: 200,000 rounds) to further secure the secondary key and seed derivation pipelines.
-6. **Robust Bounds Checking**: The metadata deserialization parsers enforce strict size and boundary validation, ensuring graceful error reporting and immunity to memory allocation panics under wrong password or garbage inputs.
-7. **Forensic Erasure**: Zero-Disk Leakage and Active Zeroization ensure no plaintext or decrypted keys are leaked to the disk or left in memory for forensic recovery.
-8. **NLP Evasion**: Hides data in "human noise" (typos/visual twins) that AI filters cannot reliably tokenize or detect.
+3. **Oracle Resistance**: Decoupling the physical file structure (`Seed 1`) from the Master Password prevents attackers from instantly validating guesses or even locating the encrypted metadata block.
+4. **Stretched Key Derivation**: Replaces low-iteration PBKDF2 layers with configurable high-entropy stretching (default: 200,000 rounds) to further secure the secondary key and seed derivation pipelines.
+5. **Robust Bounds Checking**: The metadata deserialization parsers enforce strict size and boundary validation, ensuring graceful error reporting and immunity to memory allocation panics under wrong password or garbage inputs.
+6. **Forensic Erasure**: Zero-Disk Leakage and Active Zeroization ensure no plaintext or decrypted keys are leaked to the disk or left in memory for forensic recovery.
+7. **NLP Evasion**: Hides data in "human noise" (typos/visual twins) that AI filters cannot reliably tokenize or detect.
 
 ## License
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
