@@ -10,6 +10,37 @@ import x.crypto.chacha20poly1305
 import compress.gzip
 fn C.memset(ptr voidptr, val int, size usize) voidptr
 
+fn encode_to_seed0(val u32, key_seed0 []u8) []u8 {
+    mut buf := []u8{len: 4}
+    buf[0] = u8(val >> 24)
+    buf[1] = u8(val >> 16)
+    buf[2] = u8(val >> 8)
+    buf[3] = u8(val)
+    hash := hmac_sha3_512(key_seed0, buf)
+    return hash[0..16].clone()
+}
+
+fn decode_from_seed0(target_hash []u8, key_seed0 []u8, param_name string) !u32 {
+    mut max_range := 5000000 
+    
+    println('[*] Bruteforcing ${param_name}...')
+    
+    for i in 0 .. max_range {
+        mut buf := []u8{len: 4}
+        buf[0] = u8(i >> 24)
+        buf[1] = u8(i >> 16)
+        buf[2] = u8(i >> 8)
+        buf[3] = u8(i)
+        
+        hash := hmac_sha3_512(key_seed0, buf)
+        if hash[0..16] == target_hash {
+            return u32(i)
+        }
+    }
+    
+    return error("Seed0 Bruteforce failed for ${param_name}. Wrong key or parameter out of range.")
+}
+
 fn hmac_sha3_512(key []u8, message []u8) []u8 {
 	block_size := 72
 	mut k := []u8{len: block_size, init: 0}
@@ -1113,48 +1144,55 @@ fn deserialize_vdf_params(b []u8) !VdfParams {
 	return VdfParams{ n: n, t: t, is_pq: is_pq }
 }
 
-fn serialize_header(salt []u8, iter u32, mem u32, threads u8, cipher_len u32, proof []big.Integer, key_ciphertext []u8) []u8 {
-	mut b := []u8{}
-	for byte in salt { b << byte }
-	write_u32(mut b, iter)
-	write_u32(mut b, mem)
-	b << threads
-	write_u32(mut b, cipher_len)
-	write_u32(mut b, u32(key_ciphertext.len))
-	for byte in key_ciphertext { b << byte }
-	serialize_proof(mut b, proof)
-	return b
+fn serialize_header(key_seed0 []u8, t u64, iter u32, mem u32, threads u8, cipher_len u32, proof []big.Integer, key_ciphertext []u8) []u8 {
+    mut b := []u8{}
+    b << encode_to_seed0(u32(t), key_seed0)
+    b << encode_to_seed0(iter, key_seed0)
+    b << encode_to_seed0(mem, key_seed0)
+    b << encode_to_seed0(u32(threads), key_seed0)
+    b << encode_to_seed0(cipher_len, key_seed0)
+    
+    write_u32(mut b, u32(key_ciphertext.len))
+    for byte in key_ciphertext { b << byte }
+    serialize_proof(mut b, proof)
+    return b
 }
 
-fn deserialize_header(b []u8) !DecryptedHeader {
-	if b.len < 33 { return error('Malformed header size') }
-	mut salt := []u8{len: 16}
-	for i in 0 .. 16 { salt[i] = b[i] }
-	iter := read_u32(b, 16)
-	mem := read_u32(b, 20)
-	threads := b[24]
-	cipher_len := read_u32(b, 25)
-	key_len := read_u32(b, 29)
-	if u64(b.len) < 33 + u64(key_len) {
-		return error('Malformed header key size')
-	}
-	mut key_ciphertext := []u8{len: int(key_len)}
-	for i in 0 .. int(key_len) {
-		key_ciphertext[i] = b[33 + i]
-	}
-	mut proof_offset := ProofIndex{ val: 33 + int(key_len) }
-	proof := deserialize_proof(b, mut proof_offset) or {
-		return error('Malformed proof in header: ' + err.msg())
-	}
-	return DecryptedHeader{
-		salt: salt
-		iter: iter
-		mem: mem
-		threads: threads
-		cipher_len: cipher_len
-		proof: proof
-		key_ciphertext: key_ciphertext
-	}
+fn deserialize_header(b []u8, key_seed0 []u8, file_salt []u8) !DecryptedHeader {
+    if b.len < 80 { return error('Malformed header size (Seed0 params missing)') }
+    
+    t_val := decode_from_seed0(b[0..16], key_seed0, 't_param')!
+    iter := decode_from_seed0(b[16..32], key_seed0, 'iter')!
+    mem := decode_from_seed0(b[32..48], key_seed0, 'mem')!
+    threads := u8(decode_from_seed0(b[48..64], key_seed0, 'threads')!)
+    cipher_len := decode_from_seed0(b[64..80], key_seed0, 'cipher_len')!
+    
+    println('[+] Seed0 Extracted -> T:${t_val}, Iter:${iter}, Mem:${mem}, Len:${cipher_len}')
+
+    offset := 80
+    key_len := read_u32(b, offset)
+    
+    if u64(b.len) < u64(offset + 4 + int(key_len)) {
+        return error('Malformed header key size')
+    }
+    
+    mut key_ciphertext := []u8{len: int(key_len)}
+    for i in 0 .. int(key_len) {
+        key_ciphertext[i] = b[offset + 4 + i]
+    }
+    
+    mut proof_offset := ProofIndex{ val: offset + 4 + int(key_len) }
+    proof := deserialize_proof(b, mut proof_offset)!
+    
+    return DecryptedHeader{
+        salt: file_salt
+        iter: iter
+        mem: mem
+        threads: threads
+        cipher_len: cipher_len
+        proof: proof
+        key_ciphertext: key_ciphertext
+    }
 }
 
 fn openssl_encrypt_header(header_bytes []u8, key_hex string, iv_hex string) ![]u8 {
@@ -1313,8 +1351,11 @@ fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64, pa
 	}
 	
 	vdf_params := serialize_vdf_params(n, t_val, is_pq)
-	header_raw := serialize_header(salt, iter_val, mem_val, threads_val, u32(first_chunk_cipher.len), proof, key_ciphertext)
-	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
+	key_seed0 := pbkdf2_sha3_512(seed1_str.bytes(), file_salt, pbkdf2_iter, 32)
+	
+    header_raw := serialize_header(key_seed0, t_val, iter_val, mem_val, threads_val, u32(first_chunk_cipher.len), proof, key_ciphertext)
+    
+    encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
 	
 	mut meta := []u8{}
 	write_u16(mut meta, u16(vdf_params.len))
@@ -1522,21 +1563,13 @@ fn locktime_decrypt_flow(file_path string, out_path string, password string, see
 	header_key_iv := pbkdf2_sha3_512(password.bytes(), file_salt, pbkdf2_iter, 48)
 	header_key := header_key_iv[0..32].hex()
 	header_iv := header_key_iv[32..48].hex()
-	dec_header_bytes := openssl_decrypt_header(enc_header_bytes, header_key, header_iv) or { []u8{} }
-	header := deserialize_header(dec_header_bytes) or {
-		dummy_salt := []u8{len: 16}
-		DecryptedHeader{
-			salt: dummy_salt
-			iter: u32(3)
-			mem: u32(65536)
-			threads: u8(4)
-			cipher_len: u32(total_len - meta_total_len)
-			proof: []big.Integer{}
-			key_ciphertext: []u8{}
-		}
-	}
+	dec_header_bytes := openssl_decrypt_header(enc_header_bytes, header_key, header_iv)!
 	
-	mut cipher_len := header.cipher_len
+    key_seed0 := pbkdf2_sha3_512(seed1_str.bytes(), file_salt, pbkdf2_iter, 32)
+    
+    header := deserialize_header(dec_header_bytes, key_seed0, file_salt)!
+    
+    mut cipher_len := header.cipher_len
 	mut remaining_indices := []int{cap: if total_len > meta_total_len { total_len - meta_total_len } else { 0 }}
 	if total_len > meta_total_len {
 		for i in meta_total_len .. total_len {
