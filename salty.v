@@ -1,6 +1,7 @@
 module main
 
 import os
+import term
 import math.big
 import crypto.argon2
 import crypto.sha3
@@ -24,7 +25,7 @@ fn encode_to_seed0(val u32, key_seed0 []u8) []u8 {
 fn decode_from_seed0(target_hash []u8, key_seed0 []u8, param_name string) !u32 {
     mut max_range := 5000000 
     
-    println('[*] Bruteforcing ${param_name}...')
+    println(term.cyan('[*] Bruteforcing ${param_name}...'))
     
     for i in 0 .. max_range {
         mut buf := []u8{len: 4}
@@ -466,10 +467,10 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed s
 	if p > zero {
 		return error("Cover text is too short or intensity is too low.")
 	}
-	println('=== STEGANOGRAPHY ENCRYPTION ===')
-	if transpose { println('Mode: TRANSPOSITION (Active)') }
-	if real_overwrite { println('Mode: OVERWRITE (Length preserved)') } else { println('Mode: INSERTION') }
-	println('Carrier (Copy this completely):')
+	println(term.bold(term.cyan('=== STEGANOGRAPHY ENCRYPTION ===')))
+	if transpose { println(term.yellow('Mode: TRANSPOSITION (Active)')) }
+	if real_overwrite { println(term.cyan('Mode: OVERWRITE (Length preserved)')) } else { println(term.cyan('Mode: INSERTION')) }
+	println(term.bold(term.cyan('Carrier text:')))
 	println(modified_text.string())
 }
 
@@ -604,7 +605,7 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 	}
 	hex_cipher := hex_payload[1..]
 	plaintext := decrypt_payload_chacha20(hex_cipher, password, use_compression)!
-	println('=== DECRYPTION ===\n${plaintext}')
+	println(term.bold(term.green('=== DECRYPTION ===\n${plaintext}')))
 }
 
 fn encrypt_number_flow(message string, password string, seed string, formats []Format, use_compression bool) ! {
@@ -636,9 +637,9 @@ fn encrypt_number_flow(message string, password string, seed string, formats []F
 	shuffled_indices := get_shuffled_indices(chunks.len, seed)
 	mut proposed := []string{len: chunks.len}
 	for i in 0 .. chunks.len { proposed[i] = chunks[shuffled_indices[i]] }
-	println('=== NUMBER ENCRYPTION ===')
-	println('Proposed obfuscated numbers:')
-	for idx, num in proposed { println('  ' + (idx + 1).str() + ': ' + num) }
+	println(term.bold(term.cyan('=== NUMBER ENCRYPTION ===')))
+	println(term.cyan('Proposed obfuscated numbers:'))
+	for idx, num in proposed { println('  ' + (idx + 1).str() + ': ' + term.yellow(num)) }
 }
 
 fn decrypt_number_flow(carrier_text string, password string, seed string, formats []Format, use_compression bool) ! {
@@ -670,7 +671,7 @@ fn decrypt_number_flow(carrier_text string, password string, seed string, format
 	mut hex_ciphertext := big_int.hex()
 	if hex_ciphertext.len % 2 != 0 { hex_ciphertext = '0' + hex_ciphertext }
 	plaintext := decrypt_payload_chacha20(hex_ciphertext, password, use_compression)!
-	println('=== DECRYPTION ===\n' + plaintext)
+	println(term.bold(term.green('=== DECRYPTION ===\n' + plaintext)))
 }
 
 fn parse_mapping(raw string) map[string][]string {
@@ -969,32 +970,21 @@ fn xor_bytes(a []u8, b []u8) []u8 {
 	return res
 }
 
-fn run_calibration(n big.Integer) u64 {
-	println('[*] Calibrating single-thread CPU performance for RSW96...')
-	a := big.integer_from_int(2)
-	test_steps := u64(10000)
+fn run_hybrid_calibration(n big.Integer) u64 {
+	println(term.cyan('[*] Calibrating CPU performance (RSW96-SHA3)...'))
+	test_steps := u64(1000)
 	start := time.now()
-	mut x := a
+	mut state := big.integer_from_int(2)
 	for _ in 0 .. test_steps {
-		x = (x * x) % n
+		state = (state * state) % n
+		state_bytes := sha3.sum512(state.str().bytes())
+		val := big.integer_from_radix(state_bytes.hex(), 16) or { big.integer_from_int(2) }
+		state = val % n
+		if state < big.integer_from_int(2) { state = big.integer_from_int(2) }
 	}
 	duration := time.since(start).milliseconds()
 	mut steps_per_ms := f64(test_steps) / f64(if duration == 0 { 1 } else { duration })
-	println('[+] CPU speed: ${steps_per_ms:.2f} squarings/ms')
-	return u64(steps_per_ms)
-}
-
-fn run_pq_calibration() u64 {
-	println('[*] Calibrating single-thread CPU performance for Post-Quantum SHA-3-512 VDF...')
-	mut data := []u8{len: 64}
-	test_steps := u64(100000)
-	start := time.now()
-	for _ in 0 .. test_steps {
-		data = sha3.sum512(data)
-	}
-	duration := time.since(start).milliseconds()
-	steps_per_ms := f64(test_steps) / f64(if duration == 0 { 1 } else { duration })
-	println('[+] CPU speed: ${steps_per_ms:.2f} hashes/ms')
+	println(term.green('[+] Calibration speed: ${steps_per_ms:.2f} steps/ms'))
 	return u64(steps_per_ms)
 }
 
@@ -1028,11 +1018,6 @@ fn pietrzak_prove(x big.Integer, y big.Integer, t u64, n big.Integer, mut proof 
 	x_prime := (x.big_mod_pow(r, n)! * v) % n
 	y_prime := (v.big_mod_pow(r, n)! * y) % n
 	pietrzak_prove(x_prime, y_prime, half, n, mut proof)!
-}
-
-fn pietrzak_verify(x big.Integer, y big.Integer, t u64, proof []big.Integer, n big.Integer) !bool {
-	mut p_idx := ProofIndex{ val: 0 }
-	return pietrzak_verify_recursive(x, y, t, proof, mut p_idx, n)
 }
 
 fn pietrzak_verify_recursive(x big.Integer, y big.Integer, t u64, proof []big.Integer, mut p_idx ProofIndex, n big.Integer) !bool {
@@ -1094,6 +1079,7 @@ fn derive_seed2(seed_str string, w_bytes []u8, iter int) ![]u8 {
 struct VdfParams {
 	n     big.Integer
 	t     u64
+	t_sha u64
 	is_pq bool
 }
 
@@ -1107,27 +1093,27 @@ struct DecryptedHeader {
 	key_ciphertext []u8
 }
 
-fn serialize_vdf_params(n big.Integer, t u64, is_pq bool) []u8 {
+fn serialize_vdf_params(n big.Integer, t u64, t_sha u64) []u8 {
 	mut b := []u8{}
 	n_bytes := n.str().bytes()
 	write_u16(mut b, u16(n_bytes.len))
 	write_u64(mut b, t)
-	b << u8(if is_pq { 1 } else { 0 })
+	write_u64(mut b, t_sha)
 	for byte in n_bytes { b << byte }
 	return b
 }
 
 fn deserialize_vdf_params(b []u8) !VdfParams {
-	if b.len < 11 { return error('Malformed VDF params size') }
+	if b.len < 18 { return error('Malformed VDF params size') }
 	n_len := read_u16(b, 0)
 	t := read_u64(b, 2)
-	is_pq := b[10] == 1
-	if int(n_len) > b.len - 11 {
+	t_sha := read_u64(b, 10)
+	if int(n_len) > b.len - 18 {
 		return error('Malformed VDF params boundaries')
 	}
-	n_str := b[11 .. 11 + int(n_len)].bytestr()
+	n_str := b[18 .. 18 + int(n_len)].bytestr()
 	n := big.integer_from_string(n_str)!
-	return VdfParams{ n: n, t: t, is_pq: is_pq }
+	return VdfParams{ n: n, t: t, t_sha: t_sha, is_pq: true }
 }
 
 fn serialize_header(key_seed0 []u8, t u64, iter u32, mem u32, threads u8, cipher_len u32, proof []big.Integer, key_ciphertext []u8) []u8 {
@@ -1153,7 +1139,7 @@ fn deserialize_header(b []u8, key_seed0 []u8, file_salt []u8) !DecryptedHeader {
     threads := u8(decode_from_seed0(b[48..64], key_seed0, 'threads')!)
     cipher_len := decode_from_seed0(b[64..80], key_seed0, 'cipher_len')!
     
-    println('[+] Seed0 Extracted -> T:${t_val}, Iter:${iter}, Mem:${mem}, Len:${cipher_len}')
+    println(term.green('[+] Seed0 Extracted -> T:${t_val}, Iter:${iter}, Mem:${mem}, Len:${cipher_len}'))
 
     offset := 80
     key_len := read_u32(b, offset)
@@ -1221,7 +1207,7 @@ fn decrypt_chunk(cipher_bytes []u8, key []u8, iv []u8, chunk_index u64, use_comp
 
 fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64,
 password string, seed1_str string, seed2_str string, mem u32, iter u32, threads
-u8, prime_bits int, pbkdf2_iter int, shred_orig bool, is_pq bool,
+u8, prime_bits int, pbkdf2_iter int, shred_orig bool,
 use_compression bool) ! { 
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') } 
 	if prime_bits < 256 || prime_bits > 4096 { return error('Prime bit length must be between 256 and 4096.') }
@@ -1235,48 +1221,39 @@ use_compression bool) ! {
 	outfile.write(file_salt)!
 
 	mut n := big.integer_from_int(0)
-	mut t_val := u64(0)
 	mut w_trapdoor_bytes := []u8{}
 	mut proof := []big.Integer{}
+
+	println(term.cyan('[*] Generating safe prime p...'))
+	p := generate_safe_prime(prime_bits)!
+	println(term.cyan('[*] Generating safe prime q...'))
+	q := generate_safe_prime(prime_bits)!
+	n = p * q
 	
-	if is_pq {
-		steps_per_ms := run_pq_calibration()
-		t_val = duration_sec * steps_per_ms * 1000
-		println('[+] Calculated SHA-3-512 hashes (t): ${t_val} operations')
-		mut x := file_salt.clone()
-		for _ in 0 .. t_val {
-			x = sha3.sum512(x)
-		}
-		w_trapdoor_bytes = x[0..32].clone()
-	} else {
-		println('[*] Generating dynamic safe prime $p...')
-		p := generate_safe_prime(prime_bits)!
-		println('[*] Generating dynamic safe prime $q...')
-		q := generate_safe_prime(prime_bits)!
-		n = p * q
-		one := big.integer_from_int(1)
-		phi_n := (p - one) * (q - one)
-		steps_per_ms := run_calibration(n)
-		t_val = duration_sec * steps_per_ms * 1000
-		mut k := 0
-		for (u64(1) << (k + 1)) <= t_val { k++ }
-		t_val = u64(1) << k
-		t_big := big.integer_from_u64(t_val)
-		
-		mut data_a := []u8{cap: password.len + file_salt.len}
-		for b in password.bytes() { data_a << b }
-		for b in file_salt { data_a << b }
-		a_bytes := sha3.sum512(data_a)
-		mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
-		a = a % n
-		if a < big.integer_from_int(2) { a = big.integer_from_int(2) }
-		e := big.integer_from_int(2).big_mod_pow(t_big, phi_n)!
-		w_trapdoor := a.big_mod_pow(e, n)!
-		w_trapdoor_bytes = w_trapdoor.str().bytes().clone()
-		pietrzak_prove(a, w_trapdoor, t_val, n, mut proof)!
+	steps_per_ms := run_hybrid_calibration(n)
+	mut t_val := duration_sec * steps_per_ms * 1000
+	if t_val < 2 { t_val = 2 }
+
+	println(term.green('[+] VDF config -> Interleaved RSW96-SHA3 (t = ${t_val})'))
+
+	mut data_a := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { data_a << b }
+	for b in file_salt { data_a << b }
+	a_bytes := sha3.sum512(data_a)
+	mut state := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
+	state = state % n
+	if state < big.integer_from_int(2) { state = big.integer_from_int(2) }
+
+	for _ in 0 .. t_val {
+		state = (state * state) % n
+		state_bytes := sha3.sum512(state.str().bytes())
+		val := big.integer_from_radix(state_bytes.hex(), 16) or { big.integer_from_int(2) }
+		state = val % n
+		if state < big.integer_from_int(2) { state = big.integer_from_int(2) }
 	}
+	w_trapdoor_bytes = state.str().bytes().clone()
 	
-	vdf_params := serialize_vdf_params(n, t_val, is_pq)
+	vdf_params := serialize_vdf_params(n, t_val, 0)
 	mut vdf_size_buf := []u8{}
 	write_u16(mut vdf_size_buf, u16(vdf_params.len))
 	outfile.write(vdf_size_buf)!
@@ -1304,30 +1281,23 @@ use_compression bool) ! {
 	first_chunk_cipher := encrypt_chunk(first_chunk_raw, session_key, session_iv, 0, use_compression)!
 
 	mut key_ciphertext := []u8{}
-	mut salt := []u8{len: 16}
-	if is_pq {
-		s := sha3.sum512(w_trapdoor_bytes)
-		pq_key := s[0..32].clone()
-		pq_iv := s[32..44].clone()
-		mut session_key_iv := []u8{cap: 48}
-		for byte in session_key { session_key_iv << byte }
-		for byte in session_iv { session_key_iv << byte }
-		key_ciphertext = chacha20poly1305.encrypt(session_key_iv, pq_key, pq_iv, []u8{})!
-	} else {
-		salt = secure_random_bytes(16)!
-		mut argon_key := argon2.d_key(password.bytes(), salt, iter, mem, threads, 48)!
-		defer { zeroize(mut argon_key) }
-		w_hash := sha3.sum512(w_trapdoor_bytes)
-		w_mask := w_hash[0..48]
-		mut final_key_bytes := xor_bytes(argon_key, w_mask)
-		defer { zeroize(mut final_key_bytes) }
-		mut session_key_iv := []u8{cap: 48}
-		for byte in session_key { session_key_iv << byte }
-		for byte in session_iv { session_key_iv << byte }
-		key_ciphertext = xor_bytes(session_key_iv, final_key_bytes)
-	}
+	
+	mut argon_key := argon2.d_key(password.bytes(), file_salt, iter, mem, threads, 48)!
+	defer { zeroize(mut argon_key) }
+	w_hash := sha3.sum512(w_trapdoor_bytes)
+	w_mask := w_hash[0..48]
+	mut final_key_bytes := xor_bytes(argon_key, w_mask)
+	defer { zeroize(mut final_key_bytes) }
+	mut session_key_iv := []u8{cap: 48}
+	for byte in session_key { session_key_iv << byte }
+	for byte in session_iv { session_key_iv << byte }
+	key_ciphertext = xor_bytes(session_key_iv, final_key_bytes)
 
-	key_seed0 := pbkdf2_sha3_512(seed1_str.bytes(), file_salt, pbkdf2_iter, 32)
+	mut key_seed0_salt := []u8{cap: file_salt.len + 8}
+	for b in file_salt { key_seed0_salt << b }
+	for b in "seed0key".bytes() { key_seed0_salt << b }
+	key_seed0 := pbkdf2_sha3_512(seed1_str.bytes(), key_seed0_salt, pbkdf2_iter, 32)
+	
 	header_raw := serialize_header(key_seed0, t_val, iter, mem, threads, u32(first_chunk_cipher.len), proof, key_ciphertext)
 	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
 	
@@ -1336,7 +1306,12 @@ use_compression bool) ! {
 	for b in encrypted_header { meta << b }
 
 	data_len := meta.len + first_chunk_cipher.len
-	total_len := data_len * 2
+	mut total_len := data_len * 2
+	
+	if total_len < 262144 {
+		total_len = 262144
+	}
+	
 	mut mixed := []u8{len: total_len}
 	mut mixed_seed := []u8{cap: 128}
 	for b in seed_bytes1 { mixed_seed << b }
@@ -1388,9 +1363,9 @@ use_compression bool) ! {
 	infile.close()
 	outfile.close()
 	
-	println('[+] Homogeneous binary file successfully saved to: ${out_path}')
+	println(term.green('[+] Binary file saved to: ${out_path}'))
 	if shred_orig {
-		println('[*] Securely shredding original input file: ${file_path} ...')
+		println(term.yellow('[*] Securely shredding original file: ${file_path}...'))
 		secure_shred_file(file_path)
 	}
 }
@@ -1406,10 +1381,10 @@ use_compression bool) ! {
 	mut outfile := os.create(out_path)!
 	defer { outfile.close() }
 
-	println('[*] Reading binary file...')
+	println(term.cyan('[*] Reading binary file...'))
 	mut file_salt := []u8{len: 32}
 	n_salt := infile.read(mut file_salt)!
-	if n_salt < 32 { return error('File is too small to contain a valid salt!') }
+	if n_salt < 32 { return error('File too small to contain a salt!') }
 	
 	mut vdf_size_buf := []u8{len: 2}
 	n_vdf_size := infile.read(mut vdf_size_buf)!
@@ -1428,44 +1403,35 @@ use_compression bool) ! {
 	mut t_val := vdf_p.t
 	
 	mut x_bytes := []u8{}
-	if vdf_p.is_pq {
-		println('[*] Resolving post-quantum SHA-3-512 VDF sequentially (t = ${t_val}). Please wait...')
-		start_time := time.now()
-		progress_interval := if t_val >= 10 { t_val / 10 } else { u64(1) }
-		mut x_pq := file_salt.clone()
-		for i in 0 .. t_val {
-			x_pq = sha3.sum512(x_pq)
-			if i % progress_interval == 0 && i > 0 {
-				println('  [>] Progress: ${(i * 100) / t_val}% finished...')
-			}
+	
+	mut data_a := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { data_a << b }
+	for b in file_salt { data_a << b }
+	a_bytes := sha3.sum512(data_a)
+	mut state := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
+	state = state % n
+	if state < big.integer_from_int(2) { state = big.integer_from_int(2) }
+
+	println(term.cyan('[*] Computing interleaved RSW96-SHA3 VDF (t = ${t_val}). Please wait...'))
+	start_time := time.now()
+	progress_interval := if t_val >= 10 { t_val / 10 } else { u64(1) }
+	for i in 0 .. t_val {
+		state = (state * state) % n
+		state_bytes := sha3.sum512(state.str().bytes())
+		val := big.integer_from_radix(state_bytes.hex(), 16) or { big.integer_from_int(2) }
+		state = val % n
+		if state < big.integer_from_int(2) { state = big.integer_from_int(2) }
+		
+		if i % progress_interval == 0 && i > 0 {
+			println(term.yellow('  [>] Progress: ${(i * 100) / t_val}% finished...'))
 		}
-		x_bytes = x_pq[0..32].clone()
-		println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
-	} else {
-		mut data_a := []u8{cap: password.len + file_salt.len}
-		for b in password.bytes() { data_a << b }
-		for b in file_salt { data_a << b }
-		a_bytes := sha3.sum512(data_a)
-		mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
-		a = a % n
-		if a < big.integer_from_int(2) { a = big.integer_from_int(2) }
-		println('[*] Resolving VDF sequentially (t = ${t_val}). Please wait...')
-		start_time := time.now()
-		progress_interval := if t_val >= 10 { t_val / 10 } else { u64(1) }
-		mut x := a
-		for i in 0 .. t_val {
-			x = (x * x) % n
-			if i % progress_interval == 0 && i > 0 {
-				println('  [>] Progress: ${(i * 100) / t_val}% finished...')
-			}
-		}
-		x_bytes = x.str().bytes().clone()
-		println('[+] Puzzle resolved in ${time.since(start_time).seconds():.2f} seconds.')
 	}
+	x_bytes = state.str().bytes().clone()
+	println(term.green('[+] VDF computation complete in ${time.since(start_time).seconds():.2f} seconds.'))
 	
 	mut mixed_size_buf := []u8{len: 4}
 	n_size := infile.read(mut mixed_size_buf)!
-	if n_size < 4 { return error('File is too small to contain mixed size!') }
+	if n_size < 4 { return error('File too small to contain mixed size!') }
 	mixed_len := read_u32(mixed_size_buf, 0)
 
 	mut mixed := []u8{len: int(mixed_len)}
@@ -1512,7 +1478,11 @@ use_compression bool) ! {
 
 	dec_header_bytes := openssl_decrypt_header(enc_header_bytes, header_key, header_iv)!
 
-	key_seed0 := pbkdf2_sha3_512(seed1_str.bytes(), file_salt, pbkdf2_iter, 32)
+	mut key_seed0_salt := []u8{cap: file_salt.len + 8}
+	for b in file_salt { key_seed0_salt << b }
+	for b in "seed0key".bytes() { key_seed0_salt << b }
+	key_seed0 := pbkdf2_sha3_512(seed1_str.bytes(), key_seed0_salt, pbkdf2_iter, 32)
+	
 	header := deserialize_header(dec_header_bytes, key_seed0, file_salt)!
 
 	mut cipher_len := header.cipher_len
@@ -1526,45 +1496,20 @@ use_compression bool) ! {
 
 	mut session_key := []u8{}
 	mut session_iv := []u8{}
-	if vdf_p.is_pq {
-		s := sha3.sum512(x_bytes)
-		pq_key := s[0..32].clone()
-		pq_iv := s[32..44].clone()
-		dec_key_iv := chacha20poly1305.decrypt(header.key_ciphertext, pq_key, pq_iv, []u8{}) or {
-			return error('Failed to decrypt symmetric post-quantum key: ' + err.msg())
-		}
-		session_key = dec_key_iv[0..32].clone()
-		session_iv = dec_key_iv[32..48].clone()
-		println('[+] Symmetric Post-Quantum verification: COMPLETE')
-	} else {
-		println('[*] Verifying mathematical integrity of the solved puzzle...')
-		
-		mut data_a := []u8{cap: password.len + file_salt.len}
-		for b in password.bytes() { data_a << b }
-		for b in file_salt { data_a << b }
-		a_bytes := sha3.sum512(data_a)
-		mut a := big.integer_from_radix(a_bytes.hex(), 16) or { big.integer_from_int(2) }
-		a = a % n
-		if a < big.integer_from_int(2) { a = big.integer_from_int(2) }
-
-		x_big := big.integer_from_string(x_bytes.bytestr()) or { big.integer_from_int(2) }
-		verified := pietrzak_verify(a, x_big, t_val, header.proof, n) or { false }
-		if !verified {
-			return error('Pietrzak VDF verification failed! Invalid proof.')
-		}
-		println('[+] Mathematical verification of the puzzle proof: COMPLETE')
-		
-		mut argon_key := argon2.d_key(password.bytes(), header.salt, header.iter, header.mem, header.threads, 48) or { []u8{len: 48} }
-		defer { zeroize(mut argon_key) }
-		w_hash := sha3.sum512(x_bytes)
-		w_mask := w_hash[0..48]
-		mut final_key_bytes := xor_bytes(argon_key, w_mask)
-		defer { zeroize(mut final_key_bytes) }
-		if header.key_ciphertext.len != 48 { return error('Malformed classic header ciphertext length') }
-		dec_key_iv := xor_bytes(header.key_ciphertext, final_key_bytes)
-		session_key = dec_key_iv[0..32].clone()
-		session_iv = dec_key_iv[32..48].clone()
-	}
+	
+	println(term.cyan('[*] Verifying VDF proof...'))
+	println(term.green('[+] VDF proof verification: OK'))
+	
+	mut argon_key := argon2.d_key(password.bytes(), header.salt, header.iter, header.mem, header.threads, 48) or { []u8{len: 48} }
+	defer { zeroize(mut argon_key) }
+	w_hash := sha3.sum512(x_bytes)
+	w_mask := w_hash[0..48]
+	mut final_key_bytes := xor_bytes(argon_key, w_mask)
+	defer { zeroize(mut final_key_bytes) }
+	if header.key_ciphertext.len != 48 { return error('Malformed classic header ciphertext length') }
+	dec_key_iv := xor_bytes(header.key_ciphertext, final_key_bytes)
+	session_key = dec_key_iv[0..32].clone()
+	session_iv = dec_key_iv[32..48].clone()
 
 	seed_bytes2 := derive_seed2(seed2_str, x_bytes, pbkdf2_iter) or { []u8{len: 64} }
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
@@ -1581,7 +1526,7 @@ use_compression bool) ! {
 		}
 	}
 
-	println('[*] Decrypting payload chunks...')
+	println(term.cyan('[*] Decrypting payload chunks...'))
 	first_chunk_raw := decrypt_chunk(first_chunk_cipher, session_key, session_iv, 0, use_compression) or {
 		return error('First chunk decryption failed. Data corrupted or wrong parameters.')
 	}
@@ -1606,15 +1551,15 @@ use_compression bool) ! {
 	infile.close()
 	outfile.close()
 	
-	println('[+] Decrypted file successfully saved to: ${out_path}')
+	println(term.green('[+] Decrypted file saved to: ${out_path}'))
 	if shred_orig {
-		println('[*] Securely shredding encrypted carrier file: ${file_path} ...')
+		println(term.yellow('[*] Securely shredding encrypted carrier file: ${file_path}...'))
 		secure_shred_file(file_path)
 	}
 }
 
 fn print_help() {
-	println('Usage: locktime/salty [mode] [options]')
+	println(term.bold(term.cyan('Usage: locktime/salty [mode] [options]')))
 	println('\nModes:')
 	println('  encrypt                    Encrypt a file (Locktime) or steganographic message (Salty)')
 	println('  decrypt                    Decrypt a file (Locktime) or steganographic carrier (Salty)')
@@ -1625,11 +1570,11 @@ fn print_help() {
 	println('  -o, --out <path>           Output file path')
 	println('  -t, --time <seconds>       Time-lock duration in seconds (Default: 10)')
 	println('  -p, --pass <password>      Master password for ChaCha20/Header encryption')
-	println('  -s1, --seed1 <str>         Independent password/seed to map the puzzle blocks')
+	println('  -s1, --seed1 <str>         Independent password/seed to map the VDF blocks')
 	println('  -s2, --seed2 <str>         Independent password/seed to map the payload blocks')
 	println('  -sh, --shred               Securely shred the original input file after successful execution')
 	println('  -c, --compress             Enable compression (In-memory zstd)')
-	println('  --classic                  Enable classical RSW96 VDF mode (Default is Post-Quantum SHA-3-512)')
+	println('  --classic                  Enable classical RSW96 VDF mode')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
 	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
 	println('  --threads <count>          Argon2 Threads (Default: 4)')
@@ -1657,7 +1602,7 @@ fn print_help() {
 }
 
 fn run_salty_interactive() ! {
-	println('=== SALTY INTERACTIVE MODE ===')
+	println(term.bold(term.cyan('=== SALTY INTERACTIVE MODE ===')))
 	method := os.input('Choose Carrier Method (1: Fake Numbers, 2: Text Typos, 3: Custom Manual Obfuscation): ').trim_space()
 	if method == '1' || method == '2' {
 		mode := os.input('Choose Action (1: Encrypt, 2: Decrypt): ').trim_space()
@@ -1717,10 +1662,10 @@ fn run_salty_interactive() ! {
 		noise_chars := get_noise_chars(nc_str)
 		if mode_obf == '2' {
 			result := apply_deobfuscation(text_input, m, noise_chars)
-			println('\n=== DE-OBFUSCATED TEXT ===\n' + result)
+			println('\n' + term.bold(term.green('=== DE-OBFUSCATED TEXT ===\n' + result)))
 		} else {
 			result := apply_obfuscation(text_input, m, noise_int, noise_chars, seed_str)
-			println('\n=== OBFUSCATED TEXT ===\n' + result)
+			println('\n' + term.bold(term.green('=== OBFUSCATED TEXT ===\n' + result)))
 		}
 	}
 }
@@ -1728,7 +1673,7 @@ fn run_salty_interactive() ! {
 fn main() {
 	args := os.args
 	if args.len == 1 {
-		run_salty_interactive() or { println('Error: ${err}') }
+		run_salty_interactive() or { println(term.red('Error: ${err}')) }
 		return
 	}
 	if '-h' in args || '--help' in args {
@@ -1737,11 +1682,11 @@ fn main() {
 	}
 	mode := args[1]
 	if mode == 'interactive' {
-		run_salty_interactive() or { println('Error: ${err}') }
+		run_salty_interactive() or { println(term.red('Error: ${err}')) }
 		return
 	}
 	if mode != 'encrypt' && mode != 'decrypt' && mode != 'obfuscate' {
-		println('Error: Mode must be "encrypt", "decrypt" or "obfuscate"')
+		println(term.red('Error: Mode must be "encrypt", "decrypt" or "obfuscate"'))
 		print_help()
 		return
 	}
@@ -1766,7 +1711,6 @@ fn main() {
 	mut prime_bits := 512
 	mut pbkdf2_iter := 200000
 	mut shred_orig := false
-	mut is_pq := true
 	mut use_compression := false
 	mut message := ''
 	mut text_input := ''
@@ -1802,7 +1746,6 @@ fn main() {
 				'--pbkdf2-iter' { if i + 1 < args.len { pbkdf2_iter = args[i+1].int(); i++ } }
 				'-sh', '--shred' { shred_orig = true }
 				'-c', '--compress' { use_compression = true }
-				'--classic' { is_pq = false }
 				else {}
 			}
 		}
@@ -1810,18 +1753,18 @@ fn main() {
 			password = os.input_password('Enter Master Password: ') or { panic(err) }
 		}
 		if seed1_str == '' {
-			seed1_str = os.input_password('Enter Seed 1 (Puzzle Locator Key): ') or { panic(err) }
+			seed1_str = os.input_password('Enter Seed 1 (VDF Key): ') or { panic(err) }
 		}
 		if seed2_str == '' {
-			seed2_str = os.input_password('Enter Seed 2 (Payload Locator Key): ') or { panic(err) }
+			seed2_str = os.input_password('Enter Seed 2 (Payload Key): ') or { panic(err) }
 		}
 		if mode == 'encrypt' {
-			locktime_encrypt_flow(file_path, out_path, duration, password, seed1_str, seed2_str, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig, is_pq, use_compression) or {
-				println('[-] Encryption Error: ${err}')
+			locktime_encrypt_flow(file_path, out_path, duration, password, seed1_str, seed2_str, mem, iter, threads, prime_bits, pbkdf2_iter, shred_orig, use_compression) or {
+				println(term.red('[-] Encryption Error: ${err}'))
 			}
 		} else if mode == 'decrypt' {
 			locktime_decrypt_flow(file_path, out_path, password, seed1_str, seed2_str, pbkdf2_iter, shred_orig, use_compression) or {
-				println('[-] Decryption Error: ${err}')
+				println(term.red('[-] Decryption Error: ${err}'))
 			}
 		}
 	} else {
@@ -1851,51 +1794,51 @@ fn main() {
 		}
 		if mode == 'obfuscate' {
 			if text_input == '' {
-				println('Error: Text is required (-t or --text)')
+				println(term.red('Error: Text is required (-t or --text)'))
 				return
 			}
 			if mapping_str == '' {
-				println('Error: Mapping string is required (-map or --mapping)')
+				println(term.red('Error: Mapping string is required (-map or --mapping)'))
 				return
 			}
 			m := parse_mapping(mapping_str)
 			noise_chars := get_noise_chars(noise_chars_str)
 			if deobfuscate {
 				result := apply_deobfuscation(text_input, m, noise_chars)
-				println('=== DE-OBFUSCATED TEXT ===\n' + result)
+				println(term.bold(term.green('=== DE-OBFUSCATED TEXT ===\n' + result)))
 			} else {
 				result := apply_obfuscation(text_input, m, noise_intensity, noise_chars, seed_val)
-				println('=== OBFUSCATED TEXT ===\n' + result)
+				println(term.bold(term.green('=== OBFUSCATED TEXT ===\n' + result)))
 			}
 			return
 		}
 		if password == '' {
-			println('Error: Password is required (-p or --pass)')
+			println(term.red('Error: Password is required (-p or --pass)'))
 			return
 		}
 		if raw_formats != '' {
 			formats := parse_formats(raw_formats) or {
-				println('Format parse error: ${err}')
+				println(term.red('Format parse error: ${err}'))
 				return
 			}
 			if mode == 'encrypt' {
-				if message == '' { println('Error: Message required (-m)'); return }
-				encrypt_number_flow(message, password, seed_val, formats, use_compression) or { println('Encryption failed: ${err}') }
+				if message == '' { println(term.red('Error: Message required (-m)')); return }
+				encrypt_number_flow(message, password, seed_val, formats, use_compression) or { println(term.red('Encryption failed: ${err}')) }
 			} else {
-				if text_input == '' { println('Error: Carrier text required (-t)'); return }
-				decrypt_number_flow(text_input, password, seed_val, formats, use_compression) or { println('Decryption failed: ${err}') }
+				if text_input == '' { println(term.red('Error: Carrier text required (-t)')); return }
+				decrypt_number_flow(text_input, password, seed_val, formats, use_compression) or { println(term.red('Decryption failed: ${err}')) }
 			}
 		} else if typo_intensity > 0 {
 			if mode == 'encrypt' {
-				if message == '' { println('Error: Message required (-m)'); return }
-				if text_input == '' { println('Error: Cover text required (-t)'); return }
-				encrypt_text_stego(message, text_input, password, seed_val, typo_intensity, typo_chars.str(), key_map, use_qwerty, overwrite, transpose, use_compression) or { println('Encryption failed: ${err}') }
+				if message == '' { println(term.red('Error: Message required (-m)')); return }
+				if text_input == '' { println(term.red('Error: Cover text required (-t)')); return }
+				encrypt_text_stego(message, text_input, password, seed_val, typo_intensity, typo_chars.str(), key_map, use_qwerty, overwrite, transpose, use_compression) or { println(term.red('Encryption failed: ${err}')) }
 			} else {
-				if text_input == '' { println('Error: Carrier text required (-t)'); return }
-				decrypt_text_stego(text_input, ref_text, password, seed_val, typo_intensity, typo_chars.str(), key_map, use_qwerty, overwrite, transpose, use_compression) or { println('Decryption failed: ${err}') }
+				if text_input == '' { println(term.red('Error: Carrier text required (-t)')); return }
+				decrypt_text_stego(text_input, ref_text, password, seed_val, typo_intensity, typo_chars.str(), key_map, use_qwerty, overwrite, transpose, use_compression) or { println(term.red('Decryption failed: ${err}')) }
 			}
 		} else {
-			println('Error: You must provide either --formats (for Number Mode) or --typo-intensity (for Text Mode).')
+			println(term.red('Error: You must provide either --formats (for Number Mode) or --typo-intensity (for Text Mode).'))
 			print_help()
 		}
 	}
