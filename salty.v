@@ -809,15 +809,6 @@ fn apply_deobfuscation(text string, m map[string][]string, noise_chars []rune) s
 	return out
 }
 
-fn write_u16(mut b []u8, val u16) {
-	b << u8(val >> 8)
-	b << u8(val)
-}
-
-fn read_u16(b []u8, offset int) u16 {
-	return (u16(b[offset]) << 8) | u16(b[offset + 1])
-}
-
 fn write_u32(mut b []u8, val u32) {
 	b << u8(val >> 24)
 	b << u8(val >> 16)
@@ -838,14 +829,6 @@ fn write_u64(mut b []u8, val u64) {
 	b << u8(val >> 16)
 	b << u8(val >> 8)
 	b << u8(val)
-}
-
-fn read_u64(b []u8, offset int) u64 {
-	mut val := u64(0)
-	for i in 0 .. 8 {
-		val = (val << 8) | u64(b[offset + i])
-	}
-	return val
 }
 
 fn write_u64_to_buf(mut b []u8, val u64, offset int) {
@@ -953,32 +936,23 @@ fn derive_seed2(seed_str string, w_bytes []u8, iter int) ![]u8 {
 }
 
 struct DecryptedHeader {
-	salt           []u8
-	iter           u32
-	mem            u32
-	threads        u8
-	cipher_len     u32
-	key_ciphertext []u8
+	salt            []u8
+	iter            u32
+	mem             u32
+	threads         u8
+	cipher_len      u32
+	use_compression bool
+	key_ciphertext  []u8
 }
 
-fn serialize_vdf_params(t u64) []u8 {
-	mut b := []u8{}
-	write_u64(mut b, t)
-	return b
-}
-
-fn deserialize_vdf_params(b []u8) !u64 {
-	if b.len < 8 { return error('Malformed VDF params size') }
-	return read_u64(b, 0)
-}
-
-fn serialize_header(key_seed0 []u8, t u64, iter u32, mem u32, threads u8, cipher_len u32, key_ciphertext []u8) []u8 {
+fn serialize_header(key_seed0 []u8, t u64, iter u32, mem u32, threads u8, cipher_len u32, use_compression bool, key_ciphertext []u8) []u8 {
     mut b := []u8{}
     b << encode_to_seed0(u32(t), key_seed0, 0)
     b << encode_to_seed0(iter, key_seed0, 1)
     b << encode_to_seed0(mem, key_seed0, 2)
     b << encode_to_seed0(u32(threads), key_seed0, 3)
     b << encode_to_seed0(cipher_len, key_seed0, 4)
+    b << encode_to_seed0(u32(if use_compression { 1 } else { 0 }), key_seed0, 5)
     
     write_u32(mut b, u32(key_ciphertext.len))
     for byte in key_ciphertext { b << byte }
@@ -986,17 +960,19 @@ fn serialize_header(key_seed0 []u8, t u64, iter u32, mem u32, threads u8, cipher
 }
 
 fn deserialize_header(b []u8, key_seed0 []u8, file_salt []u8) !DecryptedHeader {
-    if b.len < 160 { return error('Malformed header size (Seed0 params missing)') }
+    if b.len < 192 { return error('Malformed header size (Seed0 params missing)') }
     
     t_val := decode_from_seed0(b[0..32], key_seed0, 0, 't_param')!
     iter := decode_from_seed0(b[32..64], key_seed0, 1, 'iter')!
     mem := decode_from_seed0(b[64..96], key_seed0, 2, 'mem')!
     threads := u8(decode_from_seed0(b[96..128], key_seed0, 3, 'threads')!)
     cipher_len := decode_from_seed0(b[128..160], key_seed0, 4, 'cipher_len')!
+    comp_val := decode_from_seed0(b[160..192], key_seed0, 5, 'use_comp')!
+    use_comp := comp_val == 1
     
-    println(term.green('[+] Seed0 Extracted -> T:${t_val}, Iter:${iter}, Mem:${mem}, Len:${cipher_len}'))
+    println(term.green('[+] Seed0 Extracted -> T:${t_val}, Iter:${iter}, Mem:${mem}, Len:${cipher_len}, Comp:${use_comp}'))
 
-    offset := 160
+    offset := 192
     key_len := read_u32(b, offset)
     
     if u64(b.len) < u64(offset + 4 + int(key_len)) {
@@ -1014,6 +990,7 @@ fn deserialize_header(b []u8, key_seed0 []u8, file_salt []u8) !DecryptedHeader {
         mem: mem
         threads: threads
         cipher_len: cipher_len
+        use_compression: use_comp
         key_ciphertext: key_ciphertext
     }
 }
@@ -1070,7 +1047,7 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 	outfile.write(file_salt)!
 
 	mut w_trapdoor_bytes := []u8{}
-	
+
 	mut t_val := duration_sec
 	if t_val < 2 { t_val = 2 }
 
@@ -1085,12 +1062,6 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 	w_trapdoor_bytes = run_sequential_delay(initial_state, t_val, true)
 	lock_memory(mut w_trapdoor_bytes)
 	defer { unlock_memory(mut w_trapdoor_bytes); zeroize(mut w_trapdoor_bytes) }
-	
-	vdf_params := serialize_vdf_params(t_val)
-	mut vdf_size_buf := []u8{}
-	write_u16(mut vdf_size_buf, u16(vdf_params.len))
-	outfile.write(vdf_size_buf)!
-	outfile.write(vdf_params)!
 	
 	mut header_key_material := []u8{cap: password.len + w_trapdoor_bytes.len}
 	for b in password.bytes() { header_key_material << b }
@@ -1128,8 +1099,8 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 	lock_memory(mut argon_key)
 	defer { unlock_memory(mut argon_key); zeroize(mut argon_key) }
 
-	w_hash := sha3.sum512(w_trapdoor_bytes)
-	w_mask := w_hash[0..48]
+	w_trapdoor_hash := sha3.sum512(w_trapdoor_bytes)
+	w_mask := w_trapdoor_hash[0..48]
 	mut final_key_bytes := xor_bytes(argon_key, w_mask)
 	lock_memory(mut final_key_bytes)
 	defer { unlock_memory(mut final_key_bytes); zeroize(mut final_key_bytes) }
@@ -1147,7 +1118,7 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 	lock_memory(mut key_seed0)
 	defer { unlock_memory(mut key_seed0); zeroize(mut key_seed0) }
 	
-	header_raw := serialize_header(key_seed0, t_val, iter, mem, threads, u32(first_chunk_cipher.len), key_ciphertext)
+	header_raw := serialize_header(key_seed0, t_val, iter, mem, threads, u32(first_chunk_cipher.len), use_compression, key_ciphertext)
 	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
 	
 	mut meta := []u8{}
@@ -1190,9 +1161,20 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 	}
 	for i in 0 .. first_chunk_cipher.len { mixed[remaining_indices[i]] = first_chunk_cipher[i] }
 
+	mut mask_input := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { mask_input << b }
+	for b in file_salt { mask_input << b }
+	mask_stream := sha3.sum512(mask_input)
+
 	mut mixed_size_buf := []u8{}
 	write_u32(mut mixed_size_buf, u32(mixed.len))
-	outfile.write(mixed_size_buf)!
+
+	mut masked_mixed_size := []u8{len: 4}
+	for i in 0 .. 4 {
+		masked_mixed_size[i] = mixed_size_buf[i] ^ mask_stream[i]
+	}
+
+	outfile.write(masked_mixed_size)!
 	outfile.write(mixed)!
 
 	mut chunk_index := u64(1)
@@ -1202,9 +1184,22 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 		if n_chunk <= 0 { break }
 		chunk_data := buf[0..n_chunk].clone()
 		enc_chunk := encrypt_chunk(chunk_data, session_key, session_iv, chunk_index, use_compression)!
+
+		mut chunk_mask_input := []u8{cap: session_key.len + session_iv.len + 8}
+		for b in session_key { chunk_mask_input << b }
+		for b in session_iv { chunk_mask_input << b }
+		write_u64(mut chunk_mask_input, chunk_index)
+		chunk_mask := sha3.sum512(chunk_mask_input)
+
 		mut len_buf := []u8{}
 		write_u32(mut len_buf, u32(enc_chunk.len))
-		outfile.write(len_buf)!
+
+		mut masked_len_buf := []u8{len: 4}
+		for i in 0 .. 4 {
+			masked_len_buf[i] = len_buf[i] ^ chunk_mask[i]
+		}
+
+		outfile.write(masked_len_buf)!
 		outfile.write(enc_chunk)!
 		chunk_index++
 	}
@@ -1219,9 +1214,8 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 	}
 }
 
-fn locktime_decrypt_flow(file_path string, out_path string, password string,
-seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int, shred_orig bool,
-use_compression bool) ! { 
+fn locktime_decrypt_flow(file_path string, out_path string, duration_sec u64, password string,
+seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int, shred_orig bool) ! { 
 	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') } 
 	if os.exists(out_path) { os.rm(out_path) or {} }
 
@@ -1234,19 +1228,14 @@ use_compression bool) ! {
 	mut file_salt := []u8{len: 32}
 	n_salt := infile.read(mut file_salt)!
 	if n_salt < 32 { return error('File too small to contain a salt!') }
+
+	mut mask_input := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { mask_input << b }
+	for b in file_salt { mask_input << b }
+	mask_stream := sha3.sum512(mask_input)
 	
-	mut vdf_size_buf := []u8{len: 2}
-	n_vdf_size := infile.read(mut vdf_size_buf)!
-	if n_vdf_size < 2 { return error('Malformed VDF params size.') }
-	vdf_len := read_u16(vdf_size_buf, 0)
-
-	mut vdf_bytes := []u8{len: int(vdf_len)}
-	n_vdf := infile.read(mut vdf_bytes)!
-	if n_vdf < int(vdf_len) { return error('Truncated VDF parameters.') }
-
-	t_val := deserialize_vdf_params(vdf_bytes) or {
-		return error('Failed to deserialize VDF parameters: ' + err.msg())
-	}
+	mut t_val := duration_sec
+	if t_val < 2 { t_val = 2 }
 	
 	mut data_a := []u8{cap: password.len + file_salt.len}
 	for b in password.bytes() { data_a << b }
@@ -1261,10 +1250,19 @@ use_compression bool) ! {
 	defer { unlock_memory(mut x_bytes); zeroize(mut x_bytes) }
 	println(term.green('[+] Sequential VDF complete in ${time.since(start_time).seconds():.2f} seconds.'))
 	
-	mut mixed_size_buf := []u8{len: 4}
-	n_size := infile.read(mut mixed_size_buf)!
+	mut masked_mixed_size := []u8{len: 4}
+	n_size := infile.read(mut masked_mixed_size)!
 	if n_size < 4 { return error('File too small to contain mixed size!') }
+
+	mut mixed_size_buf := []u8{len: 4}
+	for i in 0 .. 4 {
+		mixed_size_buf[i] = masked_mixed_size[i] ^ mask_stream[i]
+	}
 	mixed_len := read_u32(mixed_size_buf, 0)
+
+	if mixed_len > 100 * 1024 * 1024 {
+		return error('Invalid mixed size parsed (wrong password or corrupted file).')
+	}
 
 	mut mixed := []u8{len: int(mixed_len)}
 	n_mixed := infile.read(mut mixed)!
@@ -1355,7 +1353,7 @@ use_compression bool) ! {
 	lock_memory(mut session_iv)
 	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
 
-	mut seed_bytes2 := derive_seed2(seed2_str, x_bytes, pbkdf2_iter) or { []u8{len: 64} }
+	mut seed_bytes2 := derive_seed2(seed2_str, x_bytes, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
 
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
@@ -1373,23 +1371,38 @@ use_compression bool) ! {
 	}
 
 	println(term.cyan('[*] Decrypting payload chunks...'))
-	first_chunk_raw := decrypt_chunk(first_chunk_cipher, session_key, session_iv, 0, use_compression) or {
+	first_chunk_raw := decrypt_chunk(first_chunk_cipher, session_key, session_iv, 0, header.use_compression) or {
 		return error('First chunk decryption failed. Data corrupted or wrong parameters.')
 	}
 	outfile.write(first_chunk_raw)!
 
 	mut chunk_index := u64(1)
 	for {
-		mut chunk_len_buf := []u8{len: 4}
-		n_len := infile.read(mut chunk_len_buf) or { 0 }
+		mut masked_len_buf := []u8{len: 4}
+		n_len := infile.read(mut masked_len_buf) or { 0 }
 		if n_len < 4 { break }
+
+		mut chunk_mask_input := []u8{cap: session_key.len + session_iv.len + 8}
+		for b in session_key { chunk_mask_input << b }
+		for b in session_iv { chunk_mask_input << b }
+		write_u64(mut chunk_mask_input, chunk_index)
+		chunk_mask := sha3.sum512(chunk_mask_input)
+
+		mut chunk_len_buf := []u8{len: 4}
+		for i in 0 .. 4 {
+			chunk_len_buf[i] = masked_len_buf[i] ^ chunk_mask[i]
+		}
 		enc_len := read_u32(chunk_len_buf, 0)
+
+		if enc_len > 10 * 1024 * 1024 {
+			return error('Invalid chunk length decoded (possibly wrong password or corrupted file).')
+		}
 		
 		mut enc_chunk := []u8{len: int(enc_len)}
 		n_chunk := infile.read(mut enc_chunk)!
 		if n_chunk < int(enc_len) { return error('Malformed file: truncated chunk!') }
 		
-		dec_chunk := decrypt_chunk(enc_chunk, session_key, session_iv, chunk_index, use_compression)!
+		dec_chunk := decrypt_chunk(enc_chunk, session_key, session_iv, chunk_index, header.use_compression)!
 		outfile.write(dec_chunk)!
 		chunk_index++
 	}
@@ -1414,7 +1427,7 @@ fn print_help() {
 	println('\nLocktime (Time-Lock Encryption) Options:')
 	println('  -f, --file <path>          Input file to encrypt/decrypt')
 	println('  -o, --out <path>           Output file path')
-	println('  -t, --time <iterations>    Direct VDF iteration count (Default: 100000)')
+	println('  -t, --time <iterations>    Direct VDF iteration count (Required for both Enc/Dec, Default: 100000)')
 	println('  -p, --pass <password>      Master password for ChaCha20/Header encryption')
 	println('  -s0, --seed0 <str>         Independent password/seed to map and lock VDF metadata')
 	println('  -s1, --seed1 <str>         Independent password/seed to map the VDF blocks')
@@ -1606,7 +1619,7 @@ fn main() {
 				println(term.red('[-] Encryption Error: ${err}'))
 			}
 		} else if mode == 'decrypt' {
-			locktime_decrypt_flow(file_path, out_path, password, seed0_str, seed1_str, seed2_str, pbkdf2_iter, shred_orig, use_compression) or {
+			locktime_decrypt_flow(file_path, out_path, duration, password, seed0_str, seed1_str, seed2_str, pbkdf2_iter, shred_orig) or {
 				println(term.red('[-] Decryption Error: ${err}'))
 			}
 		}
