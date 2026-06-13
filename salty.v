@@ -1497,8 +1497,8 @@ use_compression bool) ! {
 	mut session_key := []u8{}
 	mut session_iv := []u8{}
 	
-	println(term.cyan('[*] Verifying VDF proof...'))
-	println(term.green('[+] VDF proof verification: OK'))
+	// println(term.cyan('[*] Verifying VDF proof...'))
+	// println(term.green('[+] VDF proof verification: OK'))
 	
 	mut argon_key := argon2.d_key(password.bytes(), header.salt, header.iter, header.mem, header.threads, 48) or { []u8{len: 48} }
 	defer { zeroize(mut argon_key) }
