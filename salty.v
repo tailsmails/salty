@@ -8,7 +8,7 @@ import crypto.rand as crand
 import time
 import x.crypto.chacha20
 import x.crypto.chacha20poly1305
-import compress.gzip
+import compress.zstd
 fn C.memset(ptr voidptr, val int, size usize) voidptr
 
 fn encode_to_seed0(val u32, key_seed0 []u8) []u8 {
@@ -292,7 +292,7 @@ fn hex_to_bytes(hex_str string) ![]u8 {
 fn encrypt_payload_chacha20(plaintext string, password string, use_compression bool) !string {
 	mut payload_bytes := plaintext.bytes()
 	if use_compression {
-		payload_bytes = gzip.compress(payload_bytes)!
+		payload_bytes = zstd.compress(payload_bytes, compression_level: 19, nb_threads: 4)!
 	}
 	salt := secure_random_bytes(16)!
 	key := pbkdf2_sha3_512(password.bytes(), salt, 10000, 32)
@@ -316,7 +316,7 @@ fn decrypt_payload_chacha20(hex_ciphertext string, password string, use_compress
 		return error('Decryption failed (Wrong password or tampered data)')
 	}
 	if use_compression {
-		payload_bytes = gzip.decompress(payload_bytes) or {
+		payload_bytes = zstd.decompress(payload_bytes) or {
 			return error('Decompression failed')
 		}
 	}
@@ -1198,7 +1198,7 @@ fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) 
 fn encrypt_chunk(chunk_data []u8, key []u8, iv []u8, chunk_index u64, use_compression bool) ![]u8 {
 	mut data := chunk_data.clone()
 	if use_compression {
-		data = gzip.compress(data)!
+		data = zstd.compress(data)!
 	}
 	mut chunk_nonce := []u8{len: 12, init: 0}
 	for i in 0 .. 4 { chunk_nonce[i] = iv[i] }
@@ -1214,7 +1214,7 @@ fn decrypt_chunk(cipher_bytes []u8, key []u8, iv []u8, chunk_index u64, use_comp
 		return error('Chunk decryption failed')
 	}
 	if use_compression {
-		decrypted = gzip.decompress(decrypted)!
+		decrypted = zstd.decompress(decrypted)!
 	}
 	return decrypted
 }
@@ -1628,7 +1628,7 @@ fn print_help() {
 	println('  -s1, --seed1 <str>         Independent password/seed to map the puzzle blocks')
 	println('  -s2, --seed2 <str>         Independent password/seed to map the payload blocks')
 	println('  -sh, --shred               Securely shred the original input file after successful execution')
-	println('  -c, --compress             Enable compression (In-memory gzip)')
+	println('  -c, --compress             Enable compression (In-memory zstd)')
 	println('  --classic                  Enable classical RSW96 VDF mode (Default is Post-Quantum SHA-3-512)')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
 	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
@@ -1648,7 +1648,7 @@ fn print_help() {
 	println('  -q, --qwerty               Standard US-QWERTY proximity logic')
 	println('  -o, --overwrite            Overwrites characters instead of inserting')
 	println('  -tr, --transpose           Swaps adjacent letters instead of replacing them')
-	println('  -c, --compress             Enable compression (In-memory gzip)')
+	println('  -c, --compress             Enable compression (In-memory zstd)')
 	println('\nSalty Visual Obfuscation Options:')
 	println('  -map, --mapping <str>      Custom 1-to-many char mapping ("from:to1:to2")')
 	println('  -ni, --noise-intensity <n> Frequency of noise character injection (0-100)')
