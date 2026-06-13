@@ -903,23 +903,6 @@ fn xor_bytes(a []u8, b []u8) []u8 {
 	return res
 }
 
-fn run_sequential_calibration() f64 {
-	println(term.cyan('[*] Calibrating CPU performance (Sequential Memory-Hard SHA3-512)...'))
-	mut state := []u8{len: 64, init: 0xAA}
-	
-	start1 := time.now()
-	_ = run_sequential_delay(state, 50, false)
-	t1 := time.since(start1).milliseconds()
-	start2 := time.now()
-	_ = run_sequential_delay(state, 2050, false)
-	t2 := time.since(start2).milliseconds()
-	mut delta_t := t2 - t1
-	if delta_t <= 0 { delta_t = 1 }
-	steps_per_ms := 2000.0 / f64(delta_t)
-	println(term.green('[+] Calibration speed (Phase 2): ${steps_per_ms:.2f} steps/ms'))
-	return steps_per_ms
-}
-
 fn run_sequential_delay(initial_state []u8, t u64, show_progress bool) []u8 {
 	mut state := initial_state.clone()
 	if t == 0 { return state }
@@ -1087,9 +1070,8 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 	outfile.write(file_salt)!
 
 	mut w_trapdoor_bytes := []u8{}
-
-	steps_per_ms := run_sequential_calibration()
-	mut t_val := u64(f64(duration_sec) * steps_per_ms * 1000.0)
+	
+	mut t_val := duration_sec
 	if t_val < 2 { t_val = 2 }
 
 	println(term.green('[+] VDF config -> Interleaved Memory-Hard Sequential SHA3-512 Chain (t = ${t_val})'))
@@ -1432,7 +1414,7 @@ fn print_help() {
 	println('\nLocktime (Time-Lock Encryption) Options:')
 	println('  -f, --file <path>          Input file to encrypt/decrypt')
 	println('  -o, --out <path>           Output file path')
-	println('  -t, --time <seconds>       Time-lock duration in seconds (Default: 10)')
+	println('  -t, --time <iterations>    Direct VDF iteration count (Default: 100000)')
 	println('  -p, --pass <password>      Master password for ChaCha20/Header encryption')
 	println('  -s0, --seed0 <str>         Independent password/seed to map and lock VDF metadata')
 	println('  -s1, --seed1 <str>         Independent password/seed to map the VDF blocks')
@@ -1562,7 +1544,7 @@ fn main() {
 	}
 	mut file_path := ''
 	mut out_path := ''
-	mut duration := u64(10)
+	mut duration := u64(100000)
 	mut mem := u32(65536)
 	mut iter := u32(3)
 	mut threads := u8(4)
