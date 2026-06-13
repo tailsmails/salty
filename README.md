@@ -5,17 +5,19 @@ Salty is a lightweight command-line utility written in V for data encryption, co
 ## Features
 
 ### 1. Locktime Engine (Sequential Time-Lock Cryptography)
-- **Interleaved RSW96-SHA3 VDF**: Salty implements a step-by-step interleaved VDF combining modular squaring (RSW96) and cryptographic hashing (SHA-3-512). In each iteration of the chain, the state is squared modulo $N$ (where $N = p \cdot q$ is a product of two safe primes), and the result is immediately hashed with SHA-3-512 to produce the state for the next step.
-    - *Quantum Resistance*: This interleaving destroys the multiplicative group homomorphism after every single squaring step, preventing adversaries from using a quantum computer to factor $N$ and compute the shortcut $e = 2^t \bmod \phi(N)$.
-    - *ASIC/GPU Resistance*: Because each iteration requires a modular multiplication of large integers, specialized SHA-3 ASICs and parallel GPU architectures cannot effectively accelerate the computation due to the high sequential carry-propagation latency.
-- **Symmetric Exponentiation-Hash Key Derivation**: A 256-bit symmetric session key and 12-byte nonce are derived dynamically from the final state of the interleaved VDF. The payload is encrypted using native `ChaCha20-Poly1305` authenticated encryption.
-- **VDF-to-Header Binding**: To prevent local verification oracle attacks, the metadata decryption key (`header_key`) is cryptographically bound to the final VDF state ($w$) using PBKDF2-SHA3-512. The key to decrypt the metadata does not exist until the sequential VDF is fully resolved, forcing any attacker to perform the sequential CPU work before attempting to decrypt or verify any password/seed.
-- **Header Parameter Obfuscation (`Seed0`)**: Metadata parameters (memory, iterations, thread count, cipher length) are not stored as raw data. They are encoded as HMAC-SHA3-512 hashes. Reconstructing the header parameters requires a localized brute-force within logical bounds using a derived `Key_Seed0`. This renders the file header indistinguishable from random noise to standard file-type parsers.
-- **Triple-Key Security Model**: 
-    - **Master Password**: Used for Argon2d derivation and payload encryption.
-    - **Seed 1 (`-s1`)**: Locator key for mapping the VDF/metadata block.
-    - **Seed 2 (`-s2`)**: Locator key for mapping the encrypted payload.
-    - *Why?* Decoupling VDF configuration, block locations, and payload encryption ensures that guessing the password does not permit validation of the guess or structural detection of the blocks without the corresponding seeds.
+- **Sequential Cryptographic Hash Chain (SCHC) Time-Lock**: Salty implements a pure, highly optimized sequential cryptographic delay chain using SHA-3-512. The time-lock duration $T$ is translated into $t$ sequential SHA-3-512 iterations, where the output of each iteration is immediately fed as the input to the next.
+    - *No-Trapdoor Security*: By resolving the mathematical inconsistencies of hybrid RSW96 VDFs, Salty avoids the slow, minutes-long generation of safe primes ($p, q$) entirely, enabling instant file encryption. Since there is no algebraic trapdoor, even the creator of the file must compute the sequential delay, enforcing a strict, unbreakable mathematical timeline.
+    - *ASIC/GPU/Supercomputer Resistance*: Chaining SHA-3-512 sequentially is inherently non-parallelizable. A supercomputer with millions of cores or a specialized GPU cluster cannot compute state $i+1$ without computing state $i$. The execution speed is strictly bounded by the single-core sequential latency of the CPU.
+- **Symmetric Hash-Chain Key Derivation**: A 256-bit symmetric session key and 12-byte nonce are derived dynamically from the final state of the sequential hash chain. The payload is encrypted using native `ChaCha20-Poly1305` authenticated encryption.
+- **Delay-to-Header Binding**: To prevent local verification oracle attacks, the metadata decryption key (`header_key`) is cryptographically bound to the final state of the hash chain ($w$) using PBKDF2-SHA3-512. The key to decrypt the metadata does not exist until the sequential delay is fully resolved, forcing any attacker to perform the sequential CPU work before attempting to decrypt or verify any password/seed.
+- **Header Parameter Obfuscation & Bruteforce Trap (`Seed0`)**: Metadata parameters (duration $t$, Argon2 iterations, memory, thread count, cipher length) are encoded as HMAC-SHA3-512 hashes using a key derived from a dedicated, independent `Seed0`.
+    - *Infinite Bruteforce Honey Pot*: To reconstruct the header, Salty scans the full 32-bit (`0xFFFFFFFF` or 4.2 billion) search space. If an attacker inputs an incorrect `Seed0`, the program will not fail instantly. Instead, it gets trapped in an endless loop of up to 4.2 billion HMAC-SHA3-512 calculations, effectively acting as a CPU-melting tar-pit. Correct seeds bypass this trap instantly by matching the exact parameter values.
+- **Quad-Key Security Model**: 
+    - **Master Password**: Used for Argon2d derivation and native payload encryption.
+    - **Seed 0 (`-s0`)**: Dedicated key for encrypting and obfuscating the metadata parameters (header brute-force trap).
+    - **Seed 1 (`-s1`)**: Locator key for mapping the metadata/VDF block inside the mixed random block.
+    - **Seed 2 (`-s2`)**: Locator key for mapping the encrypted payload chunks inside the mixed random block.
+    - *Why?* Decoupling configuration parameters, block locations, and payload encryption ensures that guessing the password does not permit validation of the guess or structural detection of the blocks without the corresponding seeds.
 - **Native Cryptography**: Built-in V cryptography modules are used to process data in-memory, avoiding OS-level leakage (such as visible CLI arguments in process monitors).
 - **Forensic Erasure**: Employs secure file shredding and active memory zeroization (`memset`) to overwrite cryptographic keys.
 
@@ -41,12 +43,12 @@ pkg update -y && pkg install -y git clang make zstd && if ! command -v v >/dev/n
 ### 1. Locktime Mode (Time-Lock Encryption)
 **Encryption:**
 ```bash
-./salty encrypt -f secret.txt -o locked_file -t 10 -p "MasterPass" -s1 "Key1" -s2 "Key2" -sh
+./salty encrypt -f secret.txt -o locked_file -t 10 -p "MasterPass" -s0 "Key0" -s1 "Key1" -s2 "Key2" -sh
 ```
 
-**Decryption (Solves the VDF Puzzle):**
+**Decryption (Solves the Delay Chain):**
 ```bash
-./salty decrypt -f locked_file -o restored.txt -p "MasterPass" -s1 "Key1" -s2 "Key2"
+./salty decrypt -f locked_file -o restored.txt -p "MasterPass" -s0 "Key0" -s1 "Key1" -s2 "Key2"
 ```
 
 ### 2. Salty Mode (Steganography & Obfuscation)
@@ -68,10 +70,10 @@ pkg update -y && pkg install -y git clang make zstd && if ! command -v v >/dev/n
 ---
 
 ## Security Model
-1. **Interleaved Sequential Delay**: Forces a sequential execution time of $T$ seconds that cannot be bypassed by parallel processing or algebraic shortcuts.
-2. **Mathematical Key Binding**: Deriving the metadata decryption key from the VDF state prevents bypasses via binary modification.
-3. **Transparent VDF Parameters**: $N$ and $t$ are stored as standard, unencrypted parameters at the beginning of the file, preserving the mathematical hardness of the work without relying on security-by-obscurity.
-4. **Local Oracle Mitigation**: By requiring localized brute-forcing of HMAC-based parameters, the header does not leak configuration details or permit instant validation of guessed passwords.
+1. **Sequential Hash Chain Delay**: Forces a sequential execution time of $T$ seconds that cannot be bypassed by parallel processing or algebraic shortcuts.
+2. **Mathematical Key Binding**: Deriving the metadata decryption key from the sequential state prevents bypasses via binary modification.
+3. **No-Overhead Parameters**: Only the iteration count $t$ is stored, removing the mathematical and performance overhead of Safe Prime generation while preserving the computational hardness of the work.
+4. **Local Oracle Mitigation & Honey Pot**: By requiring localized brute-forcing of HMAC-based parameters across a full 32-bit space, the header does not leak configuration details and actively punishes incorrect parameter guesses with massive computational latency.
 5. **Strict Bounds Checking**: Validates size inputs to prevent memory allocation panics when processing wrong passwords or corrupted inputs.
 6. **Active Zeroization**: Clears keys from memory using secure memset wrappers after use.
 
