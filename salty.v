@@ -606,37 +606,50 @@ fn serialize_vfs(mut files []MemFile, temp_key []u8) ![]u8 {
 }
 
 fn deserialize_vfs(data []u8, temp_key []u8) ![]MemFile {
-	if data.len < 4 { return error('salty: invalid structures') }
-	num_files := read_u32(data, 0)
-	mut offset := 4
-	mut files := []MemFile{}
-	for _ in 0 .. num_files {
-		if offset + 4 > data.len { return error('salty: structure unpacking failure (name len)') }
-		name_len := int(read_u32(data, offset))
-		offset += 4
-		
-		if offset + name_len > data.len { return error('salty: structure unpacking failure (name)') }
-		name := data[offset .. offset + name_len].bytestr()
-		offset += name_len
-		
-		if offset + 4 > data.len { return error('salty: structure unpacking failure (data len)') }
-		data_len := int(read_u32(data, offset))
-		offset += 4
-		
-		if offset + data_len > data.len { return error('salty: structure unpacking failure (data)') }
-		plain := data[offset .. offset + data_len].clone()
-		offset += data_len
-		
-		enc_data := encrypt_vfs_file(plain, temp_key)!
-		
-		files << MemFile{
-			name: name
-			is_loaded: false
-			plain_data: []u8{}
-			enc_data: enc_data
-		}
-	}
-	return files
+    if data.len < 4 { return error('salty: invalid structures') }
+    num_files := read_u32(data, 0)
+    
+    if num_files > 100000 { 
+        return error('salty: too many files in container') 
+    }
+    
+    mut offset := 4
+    mut files := []MemFile{}
+    for _ in 0 .. num_files {
+        if offset + 4 > data.len { return error('salty: structure unpacking failure (name len)') }
+        name_len := int(read_u32(data, offset))
+        offset += 4
+        
+        if name_len <= 0 || name_len > 1024 {
+            return error('salty: invalid filename length')
+        }
+        
+        if offset + name_len > data.len { return error('salty: structure unpacking failure (name)') }
+        name := data[offset .. offset + name_len].bytestr()
+        offset += name_len
+        
+        if offset + 4 > data.len { return error('salty: structure unpacking failure (data len)') }
+        data_len := int(read_u32(data, offset))
+        offset += 4
+        
+        if data_len < 0 || data_len > 100 * 1024 * 1024 {
+            return error('salty: file payload exceeds safe limits')
+        }
+        
+        if offset + data_len > data.len { return error('salty: structure unpacking failure (data)') }
+        plain := data[offset .. offset + data_len].clone()
+        offset += data_len
+        
+        enc_data := encrypt_vfs_file(plain, temp_key)!
+        
+        files << MemFile{
+            name: name
+            is_loaded: false
+            plain_data: []u8{}
+            enc_data: enc_data
+        }
+    }
+    return files
 }
 
 fn get_all_files_recursive(dir_path string) ![]string {
@@ -709,7 +722,9 @@ fn unpack_vfs_to_folder(files []MemFile, output_folder string, temp_key []u8) ! 
 			plain = decrypt_vfs_file(f.enc_data, temp_key)!
 		}
 		
-		dest_path := os.join_path(output_folder, f.name)
+		dest_path := get_safe_destination_path(output_folder, f.name) or {
+    		return error(err.msg())
+		}
 		parent_dir := os.dir(dest_path)
 		os.mkdir_all(parent_dir) or {}
 		
@@ -1940,6 +1955,7 @@ fn run_salty_interactive() ! {
 	if method == '4' {
 		file_path := os.input('Enter container file path (e.g. secure.container): ').trim_space()
 		mut is_new := false
+		_ := is_new // false unused variable warning/error bruh
 		if !os.exists(file_path) {
 			ans := os.input('Container file does not exist. Create a new empty container? (y/n): ').trim_space().to_lower()
 			if ans == 'y' { is_new = true } else { return }
@@ -2272,4 +2288,26 @@ fn main() {
 			print_help()
 		}
 	}
+}
+
+fn get_safe_destination_path(base_dir string, rel_path string) !string {
+    if rel_path.contains('..') || rel_path.starts_with('/') || rel_path.starts_with('\\') {
+        return error('salty: path traversal attempt detected in filename: ${rel_path}')
+    }
+    
+    clean_rel := rel_path.replace('\\', '/').trim_left('/')
+    if clean_rel == '' {
+        return error('salty: empty filename inside container')
+    }
+    
+    full_path := os.join_path(base_dir, clean_rel)
+    
+    abs_base := os.real_path(base_dir)
+    abs_dest := os.real_path(os.dir(full_path))
+    
+    if !abs_dest.starts_with(abs_base) {
+        return error('salty: path traversal validation failed')
+    }
+    
+    return full_path
 }
