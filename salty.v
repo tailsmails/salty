@@ -10,33 +10,109 @@ import time
 import x.crypto.chacha20
 import x.crypto.chacha20poly1305
 import compress.zstd
-fn C.memset(ptr voidptr, val int, size usize) voidptr
 
+fn C.memset(ptr voidptr, val int, size usize) voidptr
 fn C.mlock(addr voidptr, len usize) int
 fn C.munlock(addr voidptr, len usize) int
 fn C.VirtualLock(addr voidptr, len usize) int
 fn C.VirtualUnlock(addr voidptr, len usize) int
 
+fn C.getuid() int
+fn C.signal(sig int, handler voidptr) voidptr
+fn C.printf(fmt &char, ... ) int
+fn C.system(cmd &char) int
+fn C.exit(code int)
+fn C.rmdir(path &char) int
+fn C.snprintf(str &char, size usize, format &char, ... ) int
+
+__global (
+	g_active_mount_point string
+	g_active_safe_erp string
+)
+
+fn signal_handler(sig int) {
+	unsafe {
+		C.printf(c'\nsalty: signal %d received. cleaning up...\n', sig)
+		
+		mut mp_buf := [256]char{}
+		mut erp_buf := [256]char{}
+		
+		C.snprintf(&char(&mp_buf), 256, c'%s', g_active_mount_point.str)
+		C.snprintf(&char(&erp_buf), 256, c'%s', g_active_safe_erp.str)
+		
+		if mp_buf[0] != 0 {
+			mut cmd_buf := [512]char{}
+			C.snprintf(&char(&cmd_buf), 512, c'umount -l %s 2>/dev/null', &char(&mp_buf))
+			C.system(&char(&cmd_buf))
+			
+			C.snprintf(&char(&cmd_buf), 512, c'nsenter -t 1 -m umount -l %s 2>/dev/null', &char(&mp_buf))
+			C.system(&char(&cmd_buf))
+			
+			C.rmdir(&char(&mp_buf))
+		}
+		
+		if erp_buf[0] != 0 {
+			mut cmd_buf := [512]char{}
+			C.snprintf(&char(&cmd_buf), 512, c'rm -rf %s 2>/dev/null', &char(&erp_buf))
+			C.system(&char(&cmd_buf))
+		}
+		
+		C.exit(1)
+	}
+}
+
+fn register_signals() {
+	unsafe {
+		C.signal(2, signal_handler)  // SIGINT
+		C.signal(15, signal_handler) // SIGTERM
+		C.signal(1, signal_handler)  // SIGHUP
+		C.signal(3, signal_handler)  // SIGQUIT
+	}
+}
+
 fn lock_memory(mut b []u8) {
     if b.len == 0 { return }
     unsafe {
+        mut res := 0
         $if windows {
-            C.VirtualLock(b.data, b.len)
+            res = C.VirtualLock(b.data, b.len)
         } $else {
-            C.mlock(b.data, b.len)
+            res = C.mlock(b.data, b.len)
         }
+        _ = res
     }
 }
 
 fn unlock_memory(mut b []u8) {
     if b.len == 0 { return }
     unsafe {
+        mut res := 0
         $if windows {
-            C.VirtualUnlock(b.data, b.len)
+            res = C.VirtualUnlock(b.data, b.len)
         } $else {
-            C.munlock(b.data, b.len)
+            res = C.munlock(b.data, b.len)
         }
+        _ = res
     }
+}
+
+fn check_mlock_capability() {
+	mut test_buf := []u8{len: 128}
+	unsafe {
+		$if windows {
+			res := C.VirtualLock(test_buf.data, test_buf.len)
+			if res == 0 {
+				println(term.gray('salty: memory locking is restricted. swapping might occur.'))
+			}
+		} $else {
+			res := C.mlock(test_buf.data, test_buf.len)
+			if res != 0 {
+				println(term.gray('salty: memory locking (mlock) is restricted by system limits.'))
+			} else {
+				C.munlock(test_buf.data, test_buf.len)
+			}
+		}
+	}
 }
 
 fn encode_to_seed0(val u32, key_seed0 []u8, idx u32) []u8 {
@@ -230,6 +306,1075 @@ fn secure_random_bytes(size int) ![]u8 {
 	}
 }
 
+fn hex_char_to_val(c u8) u8 {
+	if c >= 48 && c <= 57 { return c - 48 }
+	if c >= 97 && c <= 102 { return c - 87 }
+	if c >= 65 && c <= 70 { return c - 55 }
+	return 0
+}
+
+fn hex_to_bytes(hex_str string) ![]u8 {
+	if hex_str.len % 2 != 0 { return error('Invalid hex string length') }
+	mut bytes := []u8{cap: hex_str.len / 2}
+	for i := 0; i < hex_str.len; i += 2 {
+		high := hex_char_to_val(hex_str[i])
+		low := hex_char_to_val(hex_str[i + 1])
+		bytes << u8((high << 4) | low)
+	}
+	return bytes
+}
+
+fn write_u32(mut b []u8, val u32) {
+	b << u8(val >> 24)
+	b << u8(val >> 16)
+	b << u8(val >> 8)
+	b << u8(val)
+}
+
+fn read_u32(b []u8, offset int) u32 {
+	return (u32(b[offset]) << 24) | (u32(b[offset + 1]) << 16) | (u32(b[offset + 2]) << 8) | u32(b[offset + 3])
+}
+
+fn write_u64(mut b []u8, val u64) {
+	b << u8(val >> 56)
+	b << u8(val >> 48)
+	b << u8(val >> 40)
+	b << u8(val >> 32)
+	b << u8(val >> 24)
+	b << u8(val >> 16)
+	b << u8(val >> 8)
+	b << u8(val)
+}
+
+fn write_u64_to_buf(mut b []u8, val u64, offset int) {
+	for b.len < offset + 8 { b << 0 }
+	b[offset]     = u8(val >> 56)
+	b[offset + 1] = u8(val >> 48)
+	b[offset + 2] = u8(val >> 40)
+	b[offset + 3] = u8(val >> 32)
+	b[offset + 4] = u8(val >> 24)
+	b[offset + 5] = u8(val >> 16)
+	b[offset + 6] = u8(val >> 8)
+	b[offset + 7] = u8(val)
+}
+
+fn zeroize(mut b []u8) {
+	if b.len == 0 { return }
+	for i in 0 .. b.len {
+		b[i] = 0
+	}
+	if b.len > 0 {
+		if b[0] != 0 {
+			eprintln('Scrub check failed')
+		}
+	}
+}
+
+fn secure_shred_file(path string) bool {
+	if !os.exists(path) { return true }
+	size := os.file_size(path)
+	if size > 0 {
+		mut f := os.open_file(path, 'r+', 0o600) or {
+			os.chmod(path, 0o600) or {}
+			os.open_file(path, 'r+', 0o600) or {
+				eprintln('salty: error: could not write "${path}". locks or privileges issue.')
+				os.rm(path) or {}
+				return false
+			}
+		}
+		chunk_size := 65536
+		mut remaining := size
+		for remaining > 0 {
+			to_write := if remaining < u64(chunk_size) { int(remaining) } else { chunk_size }
+			mut random_data := secure_random_bytes(to_write) or {
+				[]u8{len: to_write, init: 0x00}
+			}
+			f.write(random_data) or {}
+			remaining -= u64(to_write)
+		}
+		f.close()
+	}
+	os.rm(path) or {
+		eprintln('salty: error: could not remove "${path}": ${err}')
+		return false
+	}
+	return true
+}
+
+fn xor_bytes(a []u8, b []u8) []u8 {
+	mut res := []u8{len: a.len}
+	for i in 0 .. a.len {
+		res[i] = a[i] ^ b[i]
+	}
+	return res
+}
+
+fn run_sequential_delay(initial_state []u8, t u64, show_progress bool) []u8 {
+	mut state := initial_state.clone()
+	if t == 0 { return state }
+	
+	n_blocks := 16384
+	mut buf := [][]u8{cap: n_blocks}
+	
+	mut temp := state.clone()
+	for _ in 0 .. n_blocks {
+		temp = sha3.sum512(temp).clone()
+		buf << temp.clone()
+	}
+	
+	progress_interval := if t >= 10 { t / 10 } else { u64(1) }
+	for i in u64(0) .. t {
+		mut idx_val := u64(0)
+		for j in 0 .. 8 {
+			idx_val = (idx_val << 8) | u64(state[j])
+		}
+		idx := int(idx_val % u64(n_blocks))
+		
+		mut mix := []u8{cap: 128}
+		for b in state { mix << b }
+		for b in buf[idx] { mix << b }
+		
+		state = sha3.sum512(mix).clone()
+		buf[idx] = state.clone()
+		
+		if show_progress && i % progress_interval == 0 && i > 0 {
+			println(term.gray('salty: computing delay chain progress: ${(i * 100) / t}%'))
+		}
+	}
+	return state
+}
+
+fn derive_seed1(seed_str string, file_salt []u8, pbkdf2_iter_val int) ![]u8 {
+	_ = pbkdf2_iter_val
+	mut derived := argon2.d_key(seed_str.bytes(), file_salt, 3, 32768, 2, 64)!
+	lock_memory(mut derived)
+	return derived
+}
+
+fn derive_seed2(seed_str string, w_bytes []u8, iter int) ![]u8 {
+	_ = iter
+	mut derived := argon2.d_key(seed_str.bytes(), w_bytes, 3, 32768, 2, 64)!
+	lock_memory(mut derived)
+	return derived
+}
+
+struct DecryptedHeader {
+	salt            []u8
+	iter            u32
+	mem             u32
+	threads         u8
+	cipher_len      u32
+	use_compression bool
+	key_ciphertext  []u8
+}
+
+fn serialize_header(key_seed0 []u8, t u64, iter u32, mem u32, threads u8, cipher_len u32, use_compression bool, key_ciphertext []u8) []u8 {
+    mut b := []u8{}
+    b << encode_to_seed0(u32(t), key_seed0, 0)
+    b << encode_to_seed0(iter, key_seed0, 1)
+    b << encode_to_seed0(mem, key_seed0, 2)
+    b << encode_to_seed0(u32(threads), key_seed0, 3)
+    b << encode_to_seed0(cipher_len, key_seed0, 4)
+    b << encode_to_seed0(u32(if use_compression { 1 } else { 0 }), key_seed0, 5)
+    
+    write_u32(mut b, u32(key_ciphertext.len))
+    for byte in key_ciphertext { b << byte }
+    return b
+}
+
+fn deserialize_header(b []u8, key_seed0 []u8, file_salt []u8) !DecryptedHeader {
+    if b.len < 192 { return error('salty: invalid header configuration size') }
+    
+    t_val := decode_from_seed0(b[0..32], key_seed0, 0, 't_param')!
+    iter := decode_from_seed0(b[32..64], key_seed0, 1, 'iter')!
+    mem := decode_from_seed0(b[64..96], key_seed0, 2, 'mem')!
+    threads := u8(decode_from_seed0(b[96..128], key_seed0, 3, 'threads')!)
+    cipher_len := decode_from_seed0(b[128..160], key_seed0, 4, 'cipher_len')!
+    comp_val := decode_from_seed0(b[160..192], key_seed0, 5, 'use_comp')!
+    use_comp := comp_val == 1
+    
+    println(term.gray('salty: header metadata extracted (t=${t_val}, mem=${mem}, len=${cipher_len})'))
+
+    offset := 192
+    key_len := read_u32(b, offset)
+    
+    if u64(b.len) < u64(offset + 4 + int(key_len)) {
+        return error('salty: malformed header payload length')
+    }
+    
+    mut key_ciphertext := []u8{len: int(key_len)}
+    for i in 0 .. int(key_len) {
+        key_ciphertext[i] = b[offset + 4 + i]
+    }
+    
+    return DecryptedHeader{
+        salt: file_salt
+        iter: iter
+        mem: mem
+        threads: threads
+        cipher_len: cipher_len
+        use_compression: use_comp
+        key_ciphertext: key_ciphertext
+    }
+}
+
+fn openssl_encrypt_header(header_bytes []u8, key_hex string, iv_hex string) ![]u8 {
+	key := hex_to_bytes(key_hex)!
+	iv := hex_to_bytes(iv_hex)!
+	nonce := iv[0..12]
+	return chacha20.encrypt(key, nonce, header_bytes)!
+}
+
+fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) ![]u8 {
+	key := hex_to_bytes(key_hex)!
+	iv := hex_to_bytes(iv_hex)!
+	nonce := iv[0..12]
+	return chacha20.decrypt(key, nonce, enc_header_bytes)!
+}
+
+fn encrypt_chunk(chunk_data []u8, key []u8, iv []u8, chunk_index u64, use_compression bool) ![]u8 {
+	mut data := chunk_data.clone()
+	if use_compression {
+		data = zstd.compress(data)!
+	}
+	mut chunk_nonce := []u8{len: 12, init: 0}
+	for i in 0 .. 4 { chunk_nonce[i] = iv[i] }
+	write_u64_to_buf(mut chunk_nonce, chunk_index, 4)
+	return chacha20poly1305.encrypt(data, key, chunk_nonce, []u8{})!
+}
+
+fn decrypt_chunk(cipher_bytes []u8, key []u8, iv []u8, chunk_index u64, use_compression bool) ![]u8 {
+	mut chunk_nonce := []u8{len: 12, init: 0}
+	for i in 0 .. 4 { chunk_nonce[i] = iv[i] }
+	write_u64_to_buf(mut chunk_nonce, chunk_index, 4)
+	mut decrypted := chacha20poly1305.decrypt(cipher_bytes, key, chunk_nonce, []u8{}) or {
+		return error('salty: chunk payload decryption failed')
+	}
+	if use_compression {
+		decrypted = zstd.decompress(decrypted)!
+	}
+	return decrypted
+}
+
+struct MemFile {
+mut:
+	name       string
+	is_loaded  bool
+	plain_data []u8
+	enc_data   []u8
+}
+
+fn encrypt_vfs_file(plain []u8, key []u8) ![]u8 {
+	nonce := secure_random_bytes(12)!
+	cipher := chacha20poly1305.encrypt(plain, key, nonce, []u8{})!
+	mut out := []u8{cap: 12 + cipher.len}
+	for b in nonce { out << b }
+	for b in cipher { out << b }
+	return out
+}
+
+fn decrypt_vfs_file(enc []u8, key []u8) ![]u8 {
+	if enc.len < 12 { return error('salty: memory structure payload error') }
+	nonce := enc[0..12]
+	cipher := enc[12..]
+	return chacha20poly1305.decrypt(cipher, key, nonce, []u8{}) or {
+		return error('salty: memory structure decryption failed')
+	}
+}
+
+fn serialize_vfs(mut files []MemFile, temp_key []u8) ![]u8 {
+	mut buf := []u8{}
+	write_u32(mut buf, u32(files.len))
+	for mut f in files {
+		mut plain := []u8{}
+		if f.is_loaded {
+			plain = f.plain_data.clone()
+		} else {
+			plain = decrypt_vfs_file(f.enc_data, temp_key)!
+		}
+		
+		name_bytes := f.name.bytes()
+		write_u32(mut buf, u32(name_bytes.len))
+		for b in name_bytes { buf << b }
+		
+		write_u32(mut buf, u32(plain.len))
+		for b in plain { buf << b }
+		
+		zeroize(mut plain)
+	}
+	return buf
+}
+
+fn deserialize_vfs(data []u8, temp_key []u8) ![]MemFile {
+	if data.len < 4 { return error('salty: invalid structures') }
+	num_files := read_u32(data, 0)
+	mut offset := 4
+	mut files := []MemFile{}
+	for _ in 0 .. num_files {
+		if offset + 4 > data.len { return error('salty: structure unpacking failure (name len)') }
+		name_len := int(read_u32(data, offset))
+		offset += 4
+		
+		if offset + name_len > data.len { return error('salty: structure unpacking failure (name)') }
+		name := data[offset .. offset + name_len].bytestr()
+		offset += name_len
+		
+		if offset + 4 > data.len { return error('salty: structure unpacking failure (data len)') }
+		data_len := int(read_u32(data, offset))
+		offset += 4
+		
+		if offset + data_len > data.len { return error('salty: structure unpacking failure (data)') }
+		plain := data[offset .. offset + data_len].clone()
+		offset += data_len
+		
+		enc_data := encrypt_vfs_file(plain, temp_key)!
+		
+		files << MemFile{
+			name: name
+			is_loaded: false
+			plain_data: []u8{}
+			enc_data: enc_data
+		}
+	}
+	return files
+}
+
+fn get_all_files_recursive(dir_path string) ![]string {
+	mut result := []string{}
+	items := os.ls(dir_path) or { return []string{} }
+	for item in items {
+		full_path := os.join_path(dir_path, item)
+		if os.is_dir(full_path) {
+			sub_files := get_all_files_recursive(full_path)!
+			for sf in sub_files {
+				result << sf
+			}
+		} else {
+			result << full_path
+		}
+	}
+	return result
+}
+
+fn pack_source_to_vfs(source_path string, temp_key []u8) ![]MemFile {
+	mut files := []MemFile{}
+	if os.is_dir(source_path) {
+		all_paths := get_all_files_recursive(source_path)!
+		clean_folder := source_path.replace('\\', '/').trim_right('/')
+		for path in all_paths {
+			clean_path := path.replace('\\', '/')
+			mut relative_path := clean_path
+			if clean_path.starts_with(clean_folder + '/') {
+				relative_path = clean_path[clean_folder.len + 1 .. ]
+			}
+			
+			mut content := os.read_bytes(path)!
+			lock_memory(mut content)
+			defer { unlock_memory(mut content); zeroize(mut content) }
+			
+			enc := encrypt_vfs_file(content, temp_key)!
+			files << MemFile{
+				name: relative_path
+				is_loaded: false
+				plain_data: []u8{}
+				enc_data: enc
+			}
+		}
+	} else if os.exists(source_path) {
+		filename := os.file_name(source_path)
+		mut content := os.read_bytes(source_path)!
+		lock_memory(mut content)
+		defer { unlock_memory(mut content); zeroize(mut content) }
+		
+		enc := encrypt_vfs_file(content, temp_key)!
+		files << MemFile{
+			name: filename
+			is_loaded: false
+			plain_data: []u8{}
+			enc_data: enc
+		}
+	} else {
+		return error('salty: source path "${source_path}" not found')
+	}
+	return files
+}
+
+fn unpack_vfs_to_folder(files []MemFile, output_folder string, temp_key []u8) ! {
+	os.mkdir_all(output_folder) or {}
+	for f in files {
+		mut plain := []u8{}
+		if f.is_loaded {
+			plain = f.plain_data.clone()
+		} else {
+			plain = decrypt_vfs_file(f.enc_data, temp_key)!
+		}
+		
+		dest_path := os.join_path(output_folder, f.name)
+		parent_dir := os.dir(dest_path)
+		os.mkdir_all(parent_dir) or {}
+		
+		if os.exists(dest_path) {
+			os.chmod(dest_path, 0o600) or {}
+		}
+		
+		os.write_bytes(dest_path, plain) or {
+			return error('salty: write failed "${dest_path}": ${err}')
+		}
+		zeroize(mut plain)
+	}
+}
+
+fn shred_and_remove_dir_recursive(dir_path string) ! {
+	if !os.is_dir(dir_path) { return }
+	items := os.ls(dir_path) or { return }
+	mut has_failures := false
+	for item in items {
+		full_path := os.join_path(dir_path, item)
+		if os.is_dir(full_path) {
+			shred_and_remove_dir_recursive(full_path) or {
+				has_failures = true
+			}
+		} else {
+			success := secure_shred_file(full_path)
+			if !success {
+				has_failures = true
+			}
+		}
+	}
+	os.rmdir(dir_path) or {
+		if has_failures {
+			return error('salty: some files are locked and could not be removed')
+		}
+		return error('salty: directory removal failed "${dir_path}": ${err}')
+	}
+	if has_failures {
+		return error('salty: shred failed on some files')
+	}
+}
+
+fn check_dir_write_permission(dir_path string) ! {
+	temp_file := os.join_path(dir_path, '.salty_temp_write_test')
+	os.write_file(temp_file, 'test') or {
+		return error('salty: write permission denied in directory "${dir_path}"')
+	}
+	os.rm(temp_file) or {}
+}
+
+fn verify_write_permission(file_path string) ! {
+	if os.exists(file_path) {
+		mut f := os.open_file(file_path, 'r+', 0o600) or {
+			return error('salty: write permission denied for output container "${file_path}"')
+		}
+		f.close()
+	} else {
+		mut f := os.create(file_path) or {
+			return error('salty: write permission denied for output container "${file_path}"')
+		}
+		f.close()
+		os.rm(file_path) or {}
+	}
+}
+
+fn run_cmd(cmd string) bool {
+	res := os.execute(cmd)
+	if res.exit_code != 0 {
+		return false
+	}
+	return true
+}
+
+fn sanitize_path(path string) string {
+	return "'" + path.replace("'", "'\\''") + "'"
+}
+
+fn is_mounted(path string) bool {
+	if !os.exists('/proc/mounts') { return false }
+	lines := os.read_lines('/proc/mounts') or { return false }
+	clean_path := os.real_path(path)
+	for line in lines {
+		parts := line.split(' ')
+		if parts.len >= 2 {
+			mount_point := parts[1]
+			if os.real_path(mount_point) == clean_path {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+fn execute_unmount(mount_point string, safe_erp string) ! {
+	safe_mount_point := sanitize_path(mount_point)
+	
+	if is_mounted(mount_point) {
+		println(term.gray('salty: unmounting "${mount_point}"...'))
+		if !run_cmd('umount ${safe_mount_point}') {
+			println(term.gray('salty: standard umount failed. trying lazy umount...'))
+			if !run_cmd('umount -l ${safe_mount_point}') {
+				println(term.red('salty: error: could not unmount "${mount_point}"'))
+			}
+		}
+		run_cmd('nsenter -t 1 -m umount -l ${safe_mount_point}')
+	}
+	
+	if safe_erp != '' && os.exists(safe_erp) {
+		println(term.gray('salty: shredding in-memory RAM files...'))
+		shred_and_remove_dir_recursive(safe_erp) or {
+			println(term.red('salty: error during RAM shredding: ${err}'))
+		}
+	}
+	
+	if os.exists(mount_point) {
+		os.rmdir(mount_point) or {}
+	}
+}
+
+fn locktime_decrypt_mem(file_path string, duration_sec u64, password string,
+seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 { 
+	if !os.exists(file_path) { return error('salty: container path not found') } 
+
+	mut infile := os.open(file_path)!
+	defer { infile.close() }
+
+	println(term.gray('salty: reading container...'))
+	mut file_salt := []u8{len: 32}
+	n_salt := infile.read(mut file_salt)!
+	if n_salt < 32 { return error('salty: invalid file size') }
+
+	mut mask_input := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { mask_input << b }
+	for b in file_salt { mask_input << b }
+	mask_stream := sha3.sum512(mask_input)
+	
+	mut t_val := duration_sec
+	if t_val < 2 { t_val = 2 }
+	
+	mut data_a := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { data_a << b }
+	for b in file_salt { data_a << b }
+	initial_state := sha3.sum512(data_a)
+
+	println(term.gray('salty: computing sequential delay chain (t=${t_val})...'))
+	start_time := time.now()
+	
+	mut x_bytes := run_sequential_delay(initial_state, t_val, true)
+	lock_memory(mut x_bytes)
+	defer { unlock_memory(mut x_bytes); zeroize(mut x_bytes) }
+	println(term.gray('salty: sequential delay chain completed in ${time.since(start_time).seconds():.2f}s.'))
+	
+	mut masked_mixed_size := []u8{len: 4}
+	n_size := infile.read(mut masked_mixed_size)!
+	if n_size < 4 { return error('salty: invalid file structure') }
+
+	mut mixed_size_buf := []u8{len: 4}
+	for i in 0 .. 4 {
+		mixed_size_buf[i] = masked_mixed_size[i] ^ mask_stream[i]
+	}
+	mixed_len := read_u32(mixed_size_buf, 0)
+
+	if mixed_len > 100 * 1024 * 1024 {
+		return error('salty: payload limit exceeded')
+	}
+
+	mut mixed := []u8{len: int(mixed_len)}
+	n_mixed := infile.read(mut mixed)!
+	if n_mixed < int(mixed_len) { return error('salty: truncated file structure') }
+
+	total_len := mixed.len
+	mut seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
+	defer { unlock_memory(mut seed_bytes1); zeroize(mut seed_bytes1) }
+
+	mut all_indices := []int{len: total_len}
+	for i in 0 .. total_len { all_indices[i] = i }
+	mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
+	for i := total_len - 1; i > 0; i-- {
+		j := shuffle_rng1.intn(i + 1)
+		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
+	}
+
+	mut meta_prefix := []u8{len: 4}
+	for i in 0 .. 4 { meta_prefix[i] = mixed[all_indices[i]] }
+	enc_header_len := read_u32(meta_prefix, 0)
+
+	mut safe_enc_header_len := int(enc_header_len)
+	mut rem_space := total_len - 4
+	if rem_space < 2 { rem_space = 2 }
+	if safe_enc_header_len <= 0 || safe_enc_header_len > rem_space {
+		safe_enc_header_len = rem_space
+	}
+	meta_total_len := 4 + safe_enc_header_len
+
+	mut enc_header_bytes := []u8{len: safe_enc_header_len}
+	for i in 0 .. safe_enc_header_len {
+		idx := 4 + i
+		if idx >= 0 && idx < all_indices.len {
+			enc_header_bytes[i] = mixed[all_indices[idx]]
+		}
+	}
+	
+	mut header_key_material := []u8{cap: password.len + x_bytes.len}
+	for b in password.bytes() { header_key_material << b }
+	for b in x_bytes { header_key_material << b }
+
+	header_key_iv := pbkdf2_sha3_512(header_key_material, file_salt, pbkdf2_iter, 48)
+	header_key := header_key_iv[0..32].hex()
+	header_iv := header_key_iv[32..48].hex()
+
+	dec_header_bytes := openssl_decrypt_header(enc_header_bytes, header_key, header_iv)!
+
+	mut key_seed0_salt := []u8{cap: file_salt.len + 8}
+	for b in file_salt { key_seed0_salt << b }
+	for b in "seed0key".bytes() { key_seed0_salt << b }
+	
+	mut key_seed0 := argon2.d_key(seed0_str.bytes(), key_seed0_salt, 3, 32768, 2, 32)!
+	lock_memory(mut key_seed0)
+	defer { unlock_memory(mut key_seed0); zeroize(mut key_seed0) }
+	
+	header := deserialize_header(dec_header_bytes, key_seed0, file_salt)!
+
+	mut cipher_len := header.cipher_len
+	mut remaining_indices := []int{cap: if total_len > meta_total_len { total_len - meta_total_len } else { 0 }}
+	if total_len > meta_total_len {
+		for i in meta_total_len .. total_len { remaining_indices << all_indices[i] }
+	}
+	mut safe_cipher_len := int(cipher_len)
+	max_cipher := remaining_indices.len
+	if safe_cipher_len <= 0 || safe_cipher_len > max_cipher { safe_cipher_len = max_cipher }
+
+	mut session_key := []u8{}
+	mut session_iv := []u8{}
+	
+	mut argon_key := argon2.d_key(password.bytes(), header.salt, header.iter, header.mem, header.threads, 48) or { []u8{len: 48} }
+	lock_memory(mut argon_key)
+	defer { unlock_memory(mut argon_key); zeroize(mut argon_key) }
+
+	w_hash := sha3.sum512(x_bytes)
+	w_mask := w_hash[0..48]
+	mut final_key_bytes := xor_bytes(argon_key, w_mask)
+	lock_memory(mut final_key_bytes)
+	defer { unlock_memory(mut final_key_bytes); zeroize(mut final_key_bytes) }
+
+	if header.key_ciphertext.len != 48 { return error('salty: header corrupted') }
+	dec_key_iv := xor_bytes(header.key_ciphertext, final_key_bytes)
+
+	session_key = dec_key_iv[0..32].clone()
+	lock_memory(mut session_key)
+	defer { unlock_memory(mut session_key); zeroize(mut session_key) }
+
+	session_iv = dec_key_iv[32..48].clone()
+	lock_memory(mut session_iv)
+	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
+
+	mut seed_bytes2 := derive_seed2(seed2_str, x_bytes, pbkdf2_iter)!
+	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
+
+	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
+	for i := remaining_indices.len - 1; i > 0; i-- {
+		j := shuffle_rng2.intn(i + 1)
+		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
+	}
+
+	mut first_chunk_cipher := []u8{len: safe_cipher_len}
+	for i in 0 .. safe_cipher_len {
+		if i >= 0 && i < remaining_indices.len {
+			idx := remaining_indices[i]
+			if idx >= 0 && idx < mixed.len { first_chunk_cipher[i] = mixed[idx] }
+		}
+	}
+
+	println(term.gray('salty: decrypting payload...'))
+	first_chunk_raw := decrypt_chunk(first_chunk_cipher, session_key, session_iv, 0, header.use_compression) or {
+		return error('salty: decryption failure. configuration parameters incorrect.')
+	}
+	
+	mut out_buf := []u8{cap: 10 * 1024 * 1024}
+	for b in first_chunk_raw { out_buf << b }
+
+	mut chunk_index := u64(1)
+	for {
+		mut masked_len_buf := []u8{len: 4}
+		n_len := infile.read(mut masked_len_buf) or { 0 }
+		if n_len < 4 { break }
+
+		mut chunk_mask_input := []u8{cap: session_key.len + session_iv.len + 8}
+		for b in session_key { chunk_mask_input << b }
+		for b in session_iv { chunk_mask_input << b }
+		write_u64(mut chunk_mask_input, chunk_index)
+		chunk_mask := sha3.sum512(chunk_mask_input)
+
+		mut chunk_len_buf := []u8{len: 4}
+		for i in 0 .. 4 {
+			chunk_len_buf[i] = masked_len_buf[i] ^ chunk_mask[i]
+		}
+		enc_len := read_u32(chunk_len_buf, 0)
+
+		if enc_len > 10 * 1024 * 1024 {
+			return error('salty: invalid file size parsed')
+		}
+		
+		mut enc_chunk := []u8{len: int(enc_len)}
+		n_chunk := infile.read(mut enc_chunk)!
+		if n_chunk < int(enc_len) { return error('salty: corrupted binary payloads') }
+		
+		dec_chunk := decrypt_chunk(enc_chunk, session_key, session_iv, chunk_index, header.use_compression)!
+		for b in dec_chunk { out_buf << b }
+		chunk_index++
+	}
+
+	infile.close()
+	return out_buf
+}
+
+fn locktime_encrypt_mem(vfs_payload []u8, out_path string, duration_sec u64,
+password string, seed0_str string, seed1_str string, seed2_str string, mem u32, iter u32, threads
+u8, pbkdf2_iter int, use_compression bool) ! { 
+	mut outfile := os.create(out_path)!
+	defer { outfile.close() }
+
+	file_salt := secure_random_bytes(32)!
+	outfile.write(file_salt)!
+
+	mut w_trapdoor_bytes := []u8{}
+
+	mut t_val := duration_sec
+	if t_val < 2 { t_val = 2 }
+
+	println(term.gray('salty: configuring delay chain (t=${t_val})...'))
+
+	mut data_a := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { data_a << b }
+	for b in file_salt { data_a << b }
+	initial_state := sha3.sum512(data_a)
+
+	println(term.gray('salty: computing delay chain sequential delay...'))
+	w_trapdoor_bytes = run_sequential_delay(initial_state, t_val, true)
+	lock_memory(mut w_trapdoor_bytes)
+	defer { unlock_memory(mut w_trapdoor_bytes); zeroize(mut w_trapdoor_bytes) }
+	
+	mut header_key_material := []u8{cap: password.len + w_trapdoor_bytes.len}
+	for b in password.bytes() { header_key_material << b }
+	for b in w_trapdoor_bytes { header_key_material << b }
+	
+	header_key_iv := pbkdf2_sha3_512(header_key_material, file_salt, pbkdf2_iter, 48)
+	header_key := header_key_iv[0..32].hex()
+	header_iv := header_key_iv[32..48].hex()
+
+	mut session_key := secure_random_bytes(32)!
+	lock_memory(mut session_key)
+	defer { unlock_memory(mut session_key); zeroize(mut session_key) }
+
+	mut session_iv := secure_random_bytes(16)!
+	lock_memory(mut session_iv)
+	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
+
+	mut seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
+	defer { unlock_memory(mut seed_bytes1); zeroize(mut seed_bytes1) }
+
+	mut seed_bytes2 := derive_seed2(seed2_str, w_trapdoor_bytes, pbkdf2_iter)!
+	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
+
+	chunk_size := 1024 * 1024
+	mut first_chunk_raw := []u8{}
+	mut payload_offset := 0
+	
+	first_chunk_len := if vfs_payload.len < chunk_size { vfs_payload.len } else { chunk_size }
+	if first_chunk_len > 0 {
+		first_chunk_raw = vfs_payload[0 .. first_chunk_len].clone()
+		payload_offset += first_chunk_len
+	}
+
+	first_chunk_cipher := encrypt_chunk(first_chunk_raw, session_key, session_iv, 0, use_compression)!
+
+	mut key_ciphertext := []u8{}
+	
+	mut argon_key := argon2.d_key(password.bytes(), file_salt, iter, mem, threads, 48)!
+	lock_memory(mut argon_key)
+	defer { unlock_memory(mut argon_key); zeroize(mut argon_key) }
+
+	w_trapdoor_hash := sha3.sum512(w_trapdoor_bytes)
+	w_mask := w_trapdoor_hash[0..48]
+	mut final_key_bytes := xor_bytes(argon_key, w_mask)
+	lock_memory(mut final_key_bytes)
+	defer { unlock_memory(mut final_key_bytes); zeroize(mut final_key_bytes) }
+
+	mut session_key_iv := []u8{cap: 48}
+	for byte in session_key { session_key_iv << byte }
+	for byte in session_iv { session_key_iv << byte }
+	key_ciphertext = xor_bytes(session_key_iv, final_key_bytes)
+
+	mut key_seed0_salt := []u8{cap: file_salt.len + 8}
+	for b in file_salt { key_seed0_salt << b }
+	for b in "seed0key".bytes() { key_seed0_salt << b }
+	
+	mut key_seed0 := argon2.d_key(seed0_str.bytes(), key_seed0_salt, 3, 32768, 2, 32)!
+	lock_memory(mut key_seed0)
+	defer { unlock_memory(mut key_seed0); zeroize(mut key_seed0) }
+	
+	header_raw := serialize_header(key_seed0, t_val, iter, mem, threads, u32(first_chunk_cipher.len), use_compression, key_ciphertext)
+	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
+	
+	mut meta := []u8{}
+	write_u32(mut meta, u32(encrypted_header.len))
+	for b in encrypted_header { meta << b }
+
+	data_len := meta.len + first_chunk_cipher.len
+	mut total_len := data_len * 2
+	
+	if total_len < 262144 {
+		total_len = 262144
+	}
+	
+	mut mixed := []u8{len: total_len}
+	mut mixed_seed := []u8{cap: 128}
+	for b in seed_bytes1 { mixed_seed << b }
+	for b in seed_bytes2 { mixed_seed << b }
+	mut junk_rng := SecurePRNG{seed: mixed_seed}
+	for i in 0 .. total_len { mixed[i] = u8(junk_rng.next_u8() & 0xFF) }
+
+	mut all_indices := []int{len: total_len}
+	for i in 0 .. total_len { all_indices[i] = i }
+	mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
+	for i := total_len - 1; i > 0; i-- {
+		j := shuffle_rng1.intn(i + 1)
+		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
+	}
+
+	meta_len := meta.len
+	mut meta_indices := []int{cap: meta_len}
+	for i in 0 .. meta_len { meta_indices << all_indices[i] }
+	for i in 0 .. meta_len { mixed[meta_indices[i]] = meta[i] }
+
+	mut remaining_indices := []int{cap: total_len - meta_len}
+	for i in meta_len .. total_len { remaining_indices << all_indices[i] }
+	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
+	for i := remaining_indices.len - 1; i > 0; i-- {
+		j := shuffle_rng2.intn(i + 1)
+		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
+	}
+	for i in 0 .. first_chunk_cipher.len { mixed[remaining_indices[i]] = first_chunk_cipher[i] }
+
+	mut mask_input := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { mask_input << b }
+	for b in file_salt { mask_input << b }
+	mask_stream := sha3.sum512(mask_input)
+
+	mut mixed_size_buf := []u8{}
+	write_u32(mut mixed_size_buf, u32(mixed.len))
+
+	mut masked_mixed_size := []u8{len: 4}
+	for i in 0 .. 4 {
+		masked_mixed_size[i] = mixed_size_buf[i] ^ mask_stream[i]
+	}
+
+	outfile.write(masked_mixed_size)!
+	outfile.write(mixed)!
+
+	mut chunk_index := u64(1)
+	for payload_offset < vfs_payload.len {
+		rem_len := vfs_payload.len - payload_offset
+		to_read := if rem_len < chunk_size { rem_len } else { chunk_size }
+		chunk_data := vfs_payload[payload_offset .. payload_offset + to_read].clone()
+		payload_offset += to_read
+
+		enc_chunk := encrypt_chunk(chunk_data, session_key, session_iv, chunk_index, use_compression)!
+
+		mut chunk_mask_input := []u8{cap: session_key.len + session_iv.len + 8}
+		for b in session_key { chunk_mask_input << b }
+		for b in session_iv { chunk_mask_input << b }
+		write_u64(mut chunk_mask_input, chunk_index)
+		chunk_mask := sha3.sum512(chunk_mask_input)
+
+		mut len_buf := []u8{}
+		write_u32(mut len_buf, u32(enc_chunk.len))
+
+		mut masked_len_buf := []u8{len: 4}
+		for i in 0 .. 4 {
+			masked_len_buf[i] = len_buf[i] ^ chunk_mask[i]
+		}
+
+		outfile.write(masked_len_buf)!
+		outfile.write(enc_chunk)!
+		chunk_index++
+	}
+
+	outfile.close()
+}
+
+fn run_mount_flow(container_path string, duration u64, password string,
+	seed0_str string, seed1_str string, seed2_str string, mem u32, iter u32, threads u8, 
+	pbkdf2_iter int, use_compression bool) ! {
+
+	if !os.exists(container_path) {
+		return error('salty: file path not found: ${container_path}')
+	}
+
+	$if !windows {
+		uid := C.getuid()
+		if uid != 0 {
+			println(term.gray('salty: administrative privileges (sudo/root) required for system mounts.'))
+		}
+	}
+
+	mnt_parent := './mnt'
+	if !os.exists(mnt_parent) {
+		os.mkdir(mnt_parent) or {
+			return error('salty: directory creation failed: ${err}')
+		}
+	}
+	check_dir_write_permission(mnt_parent)!
+
+	mut erp_rand := secure_random_bytes(8)!
+	safe_erp := os.join_path('/dev/shm', 'salty_erp_' + erp_rand.hex())
+	os.mkdir_all(safe_erp) or {
+		return error('salty: secure memory directory creation failed: ${err}')
+	}
+
+	container_base := os.file_name(container_path)
+	mut clean_name := container_base.all_before_last('.')
+	if clean_name == '' {
+		clean_name = container_base
+	}
+	mount_dir := os.join_path(mnt_parent, '${clean_name}_salty')
+
+	if os.exists(mount_dir) {
+		if is_mounted(mount_dir) {
+			println(term.gray('salty: active mount found. attempting unmount...'))
+			execute_unmount(mount_dir, '') or {}
+		}
+		if os.exists(mount_dir) {
+			return error('salty: mount point already exists. clean manually or run: salty unmount -f ${mount_dir}')
+		}
+	}
+	os.mkdir_all(mount_dir) or {
+		return error('salty: mount directory creation failed "${mount_dir}": ${err}')
+	}
+
+	unsafe {
+		g_active_mount_point = mount_dir
+		g_active_safe_erp = safe_erp
+	}
+
+	mut temp_key := secure_random_bytes(32)!
+	lock_memory(mut temp_key)
+	defer { unlock_memory(mut temp_key); zeroize(mut temp_key) }
+
+	println(term.gray('salty: decrypting container...'))
+	decrypted_data := locktime_decrypt_mem(container_path, duration, password, seed0_str, seed1_str, seed2_str, pbkdf2_iter)!
+	mut files := deserialize_vfs(decrypted_data, temp_key)!
+	println(term.gray('salty: decryption finished. unpacking...'))
+
+	unpack_vfs_to_folder(files, safe_erp, temp_key)!
+
+	println(term.gray('salty: binding mount directories...'))
+	s_erp := sanitize_path(safe_erp)
+	s_mount := sanitize_path(mount_dir)
+	
+	if !run_cmd('mount --bind ${s_erp} ${s_mount}') {
+		execute_unmount(mount_dir, safe_erp) or {}
+		return error('salty: mount failed. administrative privileges (su/sudo) may be missing.')
+	}
+	
+	run_cmd('mount --make-shared ${s_mount}')
+	run_cmd('nsenter -t 1 -m mount --bind ${s_erp} ${s_mount}')
+	run_cmd('nsenter -t 1 -m mount --make-shared ${s_mount}')
+
+	mut clean_exit := false
+	defer {
+		if !clean_exit {
+			println(term.gray('salty: cleanup sequence active...'))
+			execute_unmount(mount_dir, safe_erp) or {}
+		}
+	}
+
+	println('salty: container is mounted at: ${mount_dir}')
+	os.input('Press ENTER to unmount, shred temp files, and save changes... ')
+
+	println(term.gray('salty: reading changes...'))
+	mut updated_files := pack_source_to_vfs(mount_dir, temp_key)!
+
+	println(term.gray('salty: encrypting...'))
+	serialized := serialize_vfs(mut updated_files, temp_key)!
+	locktime_encrypt_mem(serialized, container_path, duration, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, use_compression)!
+	println(term.gray('salty: container updated successfully.'))
+
+	execute_unmount(mount_dir, safe_erp)!
+	clean_exit = true
+	
+	for mut f in files {
+		if f.is_loaded {
+			unlock_memory(mut f.plain_data)
+			zeroize(mut f.plain_data)
+		}
+		zeroize(mut f.enc_data)
+	}
+	for mut f in updated_files {
+		if f.is_loaded {
+			unlock_memory(mut f.plain_data)
+			zeroize(mut f.plain_data)
+		}
+		zeroize(mut f.enc_data)
+	}
+
+	println(term.gray('salty: unmount completed.'))
+}
+
+fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64,
+password string, seed0_str string, seed1_str string, seed2_str string, mem u32, iter u32, threads
+u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! { 
+	verify_write_permission(out_path)!
+
+	mut temp_key := secure_random_bytes(32)!
+	lock_memory(mut temp_key)
+	defer { unlock_memory(mut temp_key); zeroize(mut temp_key) }
+
+	mut files := pack_source_to_vfs(file_path, temp_key)!
+	serialized := serialize_vfs(mut files, temp_key)!
+	locktime_encrypt_mem(serialized, out_path, duration_sec, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, use_compression)!
+
+	if shred_orig {
+		if os.is_dir(file_path) {
+			println(term.gray('salty: shredding original folder...'))
+			shred_and_remove_dir_recursive(file_path)!
+		} else {
+			println(term.gray('salty: shredding original file...'))
+			secure_shred_file(file_path)
+		}
+	}
+}
+
+fn locktime_decrypt_flow(file_path string, out_path string, duration_sec u64, password string,
+seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int, shred_orig bool) ! { 
+	if !os.exists(file_path) { return error('salty: input container not found') }
+	
+	os.mkdir_all(out_path) or {}
+	check_dir_write_permission(out_path)!
+
+	decrypted_data := locktime_decrypt_mem(file_path, duration_sec, password, seed0_str, seed1_str, seed2_str, pbkdf2_iter)!
+
+	mut temp_key := secure_random_bytes(32)!
+	lock_memory(mut temp_key)
+	defer { unlock_memory(mut temp_key); zeroize(mut temp_key) }
+
+	mut files := deserialize_vfs(decrypted_data, temp_key)!
+	if files.len == 0 {
+		return error('salty: decrypted payload is empty')
+	}
+
+	unpack_vfs_to_folder(files, out_path, temp_key)!
+
+	for mut f in files {
+		if f.is_loaded {
+			unlock_memory(mut f.plain_data)
+			zeroize(mut f.plain_data)
+		}
+		zeroize(mut f.enc_data)
+	}
+
+	if shred_orig {
+		secure_shred_file(file_path)
+	}
+}
+
 struct Format {
 	prefix      string
 	payload_len int
@@ -247,13 +1392,13 @@ fn pad_left_zero(val int, width int) string {
 }
 
 fn parse_formats(raw string) ![]Format {
-	if raw == '' { return error('Formats string cannot be empty') }
+	if raw == '' { return error('salty: formats string cannot be empty') }
 	mut formats := []Format{}
 	for p in raw.split(',') {
 		sub := p.split(':')
-		if sub.len != 2 { return error('Invalid format: "' + p + '".') }
+		if sub.len != 2 { return error('salty: invalid format: "' + p + '"') }
 		payload_len := sub[1].int()
-		if payload_len <= 0 { return error('Payload length must be > 0') }
+		if payload_len <= 0 { return error('salty: payload length must be > 0') }
 		formats << Format{ prefix: sub[0], payload_len: payload_len }
 	}
 	return formats
@@ -300,24 +1445,6 @@ fn extract_numbers(text string) ![]string {
 	return numbers
 }
 
-fn hex_char_to_val(c u8) u8 {
-	if c >= 48 && c <= 57 { return c - 48 }
-	if c >= 97 && c <= 102 { return c - 87 }
-	if c >= 65 && c <= 70 { return c - 55 }
-	return 0
-}
-
-fn hex_to_bytes(hex_str string) ![]u8 {
-	if hex_str.len % 2 != 0 { return error('Invalid hex string length') }
-	mut bytes := []u8{cap: hex_str.len / 2}
-	for i := 0; i < hex_str.len; i += 2 {
-		high := hex_char_to_val(hex_str[i])
-		low := hex_char_to_val(hex_str[i + 1])
-		bytes << u8((high << 4) | low)
-	}
-	return bytes
-}
-
 fn encrypt_payload_chacha20(plaintext string, password string, use_compression bool) !string {
 	mut payload_bytes := plaintext.bytes()
 	if use_compression {
@@ -336,17 +1463,17 @@ fn encrypt_payload_chacha20(plaintext string, password string, use_compression b
 
 fn decrypt_payload_chacha20(hex_ciphertext string, password string, use_compression bool) !string {
 	raw_data := hex_to_bytes(hex_ciphertext)!
-	if raw_data.len < 16 + 12 { return error('Ciphertext too short or corrupted') }
+	if raw_data.len < 16 + 12 { return error('salty: ciphertext too short or corrupted') }
 	salt := raw_data[0..16]
 	nonce := raw_data[16..28]
 	encrypted := raw_data[28..]
 	key := pbkdf2_sha3_512(password.bytes(), salt, 10000, 32)
 	mut payload_bytes := chacha20poly1305.decrypt(encrypted, key, nonce, []u8{}) or {
-		return error('Decryption failed (Wrong password or tampered data)')
+		return error('salty: decryption failed (wrong password or tampered data)')
 	}
 	if use_compression {
 		payload_bytes = zstd.decompress(payload_bytes) or {
-			return error('Decompression failed')
+			return error('salty: decompression failed')
 		}
 	}
 	return payload_bytes.bytestr()
@@ -417,7 +1544,7 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed s
 	}
 	mut real_intensity := intensity
 	if real_intensity > 25 {
-		println(term.yellow('[!] Warning: Stego intensity capped at 25% to respect Square-Root Law and prevent detection.'))
+		println(term.gray('salty: warning: stego intensity capped at 25% to prevent detection.'))
 		real_intensity = 25
 	}
 	hex_cipher := encrypt_payload_chacha20(message, password, use_compression)!
@@ -498,12 +1625,9 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed s
 		i++
 	}
 	if p > zero {
-		return error("Cover text is too short or intensity is too low.")
+		return error('salty: cover text is too short or intensity is too low')
 	}
-	println(term.bold(term.cyan('=== STEGANOGRAPHY ENCRYPTION ===')))
-	if transpose { println(term.yellow('Mode: TRANSPOSITION (Active)')) }
-	if real_overwrite { println(term.cyan('Mode: OVERWRITE (Length preserved)')) } else { println(term.cyan('Mode: INSERTION')) }
-	println(term.bold(term.cyan('Carrier text:')))
+	println(term.gray('salty: carrier text generated successfully:'))
 	println(modified_text.string())
 }
 
@@ -529,7 +1653,7 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 	}
 	if real_overwrite {
 		if ref_text == '' {
-			return error("Reference text (-r) is REQUIRED for decryption in Overwrite/Transpose mode!")
+			return error('salty: reference text (-r) is required for overwrite/transpose modes')
 		}
 		ref_runes := ref_text.runes()
 		mut fallback_chars := []rune{}
@@ -559,7 +1683,7 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 						} else if modified_runes[i] == ref_runes[ref_idx] && modified_runes[i+1] == ref_runes[ref_idx+1] {
 							rem = 0
 						} else {
-							return error("Data corruption detected at transposition spot!")
+							return error('salty: transposition data corruption detected')
 						}
 						spots << DecryptSpot{rem: rem, radix: 2}
 						i += 2
@@ -572,7 +1696,7 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 						carrier_char := modified_runes[i]
 						rem := choices.index(carrier_char)
 						if rem == -1 {
-							return error("Data corruption: Extracted typo char not in valid choices.")
+							return error('salty: decoded typo char index mismatch')
 						}
 						spots << DecryptSpot{rem: rem, radix: choices.len}
 						i++
@@ -638,11 +1762,12 @@ fn decrypt_text_stego(modified_text string, ref_text string, password string, se
 	}
 	hex_payload := p.hex()
 	if hex_payload.len == 0 || hex_payload[0] != `1` { 
-		return error("Decryption failed: Corruption or wrong parameters (Seed/Intensity/Password).") 
+		return error('salty: stego layout parsing failure') 
 	}
 	hex_cipher := hex_payload[1..]
 	plaintext := decrypt_payload_chacha20(hex_cipher, password, use_compression)!
-	println(term.bold(term.green('=== DECRYPTION ===\n${plaintext}')))
+	println('salty: decrypted payload:')
+	println(plaintext)
 }
 
 fn encrypt_number_flow(message string, password string, seed string, formats []Format, use_compression bool) ! {
@@ -674,14 +1799,13 @@ fn encrypt_number_flow(message string, password string, seed string, formats []F
 	shuffled_indices := get_shuffled_indices(chunks.len, seed)
 	mut proposed := []string{len: chunks.len}
 	for i in 0 .. chunks.len { proposed[i] = chunks[shuffled_indices[i]] }
-	println(term.bold(term.cyan('=== NUMBER ENCRYPTION ===')))
-	println(term.cyan('Proposed obfuscated numbers:'))
-	for idx, num in proposed { println('  ' + (idx + 1).str() + ': ' + term.yellow(num)) }
+	println(term.gray('salty: obfuscated number chunks generated:'))
+	for idx, num in proposed { println('  ' + (idx + 1).str() + ': ' + num) }
 }
 
 fn decrypt_number_flow(carrier_text string, password string, seed string, formats []Format, use_compression bool) ! {
 	found_numbers := extract_numbers(carrier_text)!
-	if found_numbers.len == 0 { return error('No numbers found in the carrier text.') }
+	if found_numbers.len == 0 { return error('salty: no valid numbers discovered') }
 	mut chunk_formats := []Format{}
 	for i in 0 .. found_numbers.len { chunk_formats << formats[i % formats.len] }
 	shuffled_indices := get_shuffled_indices(found_numbers.len, seed)
@@ -690,25 +1814,26 @@ fn decrypt_number_flow(carrier_text string, password string, seed string, format
 		orig_idx := shuffled_indices[i]
 		fmt := chunk_formats[orig_idx]
 		num := found_numbers[i]
-		if !num.starts_with(fmt.prefix) { return error('Prefix mismatch on: ' + num) }
+		if !num.starts_with(fmt.prefix) { return error('salty: prefix verification mismatch') }
 		mut raw_payload := num[fmt.prefix.len..]
 		if raw_payload.len > fmt.payload_len { raw_payload = raw_payload[0 .. fmt.payload_len] }
 		original_chunks[orig_idx] = raw_payload
 	}
 	dec_str := original_chunks.join('')
 	if dec_str.len < 4 {
-		return error('Malformed decrypted structure: data is too short')
+		return error('salty: payload structure parsing failure')
 	}
 	payload_len := dec_str[0 .. 4].int()
 	if payload_len < 0 || 4 + payload_len > dec_str.len {
-		return error('Malformed decrypted structure: payload length out of bounds')
+		return error('salty: payload indexing mismatch')
 	}
 	dec_payload := dec_str[4 .. 4 + payload_len]
 	big_int := big.integer_from_string(dec_payload)!
 	mut hex_ciphertext := big_int.hex()
 	if hex_ciphertext.len % 2 != 0 { hex_ciphertext = '0' + hex_ciphertext }
 	plaintext := decrypt_payload_chacha20(hex_ciphertext, password, use_compression)!
-	println(term.bold(term.green('=== DECRYPTION ===\n' + plaintext)))
+	println('salty: decrypted numeric payload:')
+	println(plaintext)
 }
 
 fn parse_mapping(raw string) map[string][]string {
@@ -809,654 +1934,27 @@ fn apply_deobfuscation(text string, m map[string][]string, noise_chars []rune) s
 	return out
 }
 
-fn write_u32(mut b []u8, val u32) {
-	b << u8(val >> 24)
-	b << u8(val >> 16)
-	b << u8(val >> 8)
-	b << u8(val)
-}
-
-fn read_u32(b []u8, offset int) u32 {
-	return (u32(b[offset]) << 24) | (u32(b[offset + 1]) << 16) | (u32(b[offset + 2]) << 8) | u32(b[offset + 3])
-}
-
-fn write_u64(mut b []u8, val u64) {
-	b << u8(val >> 56)
-	b << u8(val >> 48)
-	b << u8(val >> 40)
-	b << u8(val >> 32)
-	b << u8(val >> 24)
-	b << u8(val >> 16)
-	b << u8(val >> 8)
-	b << u8(val)
-}
-
-fn write_u64_to_buf(mut b []u8, val u64, offset int) {
-	for b.len < offset + 8 { b << 0 }
-	b[offset]     = u8(val >> 56)
-	b[offset + 1] = u8(val >> 48)
-	b[offset + 2] = u8(val >> 40)
-	b[offset + 3] = u8(val >> 32)
-	b[offset + 4] = u8(val >> 24)
-	b[offset + 5] = u8(val >> 16)
-	b[offset + 6] = u8(val >> 8)
-	b[offset + 7] = u8(val)
-}
-
-fn zeroize(mut b []u8) {
-	if b.len == 0 { return }
-	for i in 0 .. b.len {
-		b[i] = 0
-	}
-	if b.len > 0 {
-		if b[0] != 0 {
-			eprintln('Scrub check failed')
-		}
-	}
-}
-
-fn secure_shred_file(path string) {
-	if !os.exists(path) { return }
-	size := os.file_size(path)
-	if size > 0 {
-		mut f := os.open_file(path, 'r+', 0o600) or {
-			os.rm(path) or {}
-			return
-		}
-		chunk_size := 65536
-		mut remaining := size
-		for remaining > 0 {
-			to_write := if remaining < u64(chunk_size) { int(remaining) } else { chunk_size }
-			mut random_data := secure_random_bytes(to_write) or {
-				[]u8{len: to_write, init: 0x00}
-			}
-			f.write(random_data) or {}
-			remaining -= u64(to_write)
-		}
-		f.close()
-	}
-	os.rm(path) or {}
-}
-
-fn xor_bytes(a []u8, b []u8) []u8 {
-	mut res := []u8{len: a.len}
-	for i in 0 .. a.len {
-		res[i] = a[i] ^ b[i]
-	}
-	return res
-}
-
-fn run_sequential_delay(initial_state []u8, t u64, show_progress bool) []u8 {
-	mut state := initial_state.clone()
-	if t == 0 { return state }
-	
-	n_blocks := 16384
-	mut buf := [][]u8{cap: n_blocks}
-	
-	mut temp := state.clone()
-	for _ in 0 .. n_blocks {
-		temp = sha3.sum512(temp).clone()
-		buf << temp.clone()
-	}
-	
-	progress_interval := if t >= 10 { t / 10 } else { u64(1) }
-	for i in u64(0) .. t {
-		mut idx_val := u64(0)
-		for j in 0 .. 8 {
-			idx_val = (idx_val << 8) | u64(state[j])
-		}
-		idx := int(idx_val % u64(n_blocks))
-		
-		mut mix := []u8{cap: 128}
-		for b in state { mix << b }
-		for b in buf[idx] { mix << b }
-		
-		state = sha3.sum512(mix).clone()
-		buf[idx] = state.clone()
-		
-		if show_progress && i % progress_interval == 0 && i > 0 {
-			println(term.yellow('  [>] Progress: ${(i * 100) / t}% finished...'))
-		}
-	}
-	return state
-}
-
-fn derive_seed1(seed_str string, file_salt []u8, pbkdf2_iter_val int) ![]u8 {
-	_ = pbkdf2_iter_val
-	mut derived := argon2.d_key(seed_str.bytes(), file_salt, 3, 32768, 2, 64)!
-	lock_memory(mut derived)
-	return derived
-}
-
-fn derive_seed2(seed_str string, w_bytes []u8, iter int) ![]u8 {
-	_ = iter
-	mut derived := argon2.d_key(seed_str.bytes(), w_bytes, 3, 32768, 2, 64)!
-	lock_memory(mut derived)
-	return derived
-}
-
-struct DecryptedHeader {
-	salt            []u8
-	iter            u32
-	mem             u32
-	threads         u8
-	cipher_len      u32
-	use_compression bool
-	key_ciphertext  []u8
-}
-
-fn serialize_header(key_seed0 []u8, t u64, iter u32, mem u32, threads u8, cipher_len u32, use_compression bool, key_ciphertext []u8) []u8 {
-    mut b := []u8{}
-    b << encode_to_seed0(u32(t), key_seed0, 0)
-    b << encode_to_seed0(iter, key_seed0, 1)
-    b << encode_to_seed0(mem, key_seed0, 2)
-    b << encode_to_seed0(u32(threads), key_seed0, 3)
-    b << encode_to_seed0(cipher_len, key_seed0, 4)
-    b << encode_to_seed0(u32(if use_compression { 1 } else { 0 }), key_seed0, 5)
-    
-    write_u32(mut b, u32(key_ciphertext.len))
-    for byte in key_ciphertext { b << byte }
-    return b
-}
-
-fn deserialize_header(b []u8, key_seed0 []u8, file_salt []u8) !DecryptedHeader {
-    if b.len < 192 { return error('Malformed header size (Seed0 params missing)') }
-    
-    t_val := decode_from_seed0(b[0..32], key_seed0, 0, 't_param')!
-    iter := decode_from_seed0(b[32..64], key_seed0, 1, 'iter')!
-    mem := decode_from_seed0(b[64..96], key_seed0, 2, 'mem')!
-    threads := u8(decode_from_seed0(b[96..128], key_seed0, 3, 'threads')!)
-    cipher_len := decode_from_seed0(b[128..160], key_seed0, 4, 'cipher_len')!
-    comp_val := decode_from_seed0(b[160..192], key_seed0, 5, 'use_comp')!
-    use_comp := comp_val == 1
-    
-    println(term.green('[+] Seed0 Extracted -> T:${t_val}, Iter:${iter}, Mem:${mem}, Len:${cipher_len}, Comp:${use_comp}'))
-
-    offset := 192
-    key_len := read_u32(b, offset)
-    
-    if u64(b.len) < u64(offset + 4 + int(key_len)) {
-        return error('Malformed header key size')
-    }
-    
-    mut key_ciphertext := []u8{len: int(key_len)}
-    for i in 0 .. int(key_len) {
-        key_ciphertext[i] = b[offset + 4 + i]
-    }
-    
-    return DecryptedHeader{
-        salt: file_salt
-        iter: iter
-        mem: mem
-        threads: threads
-        cipher_len: cipher_len
-        use_compression: use_comp
-        key_ciphertext: key_ciphertext
-    }
-}
-
-fn openssl_encrypt_header(header_bytes []u8, key_hex string, iv_hex string) ![]u8 {
-	key := hex_to_bytes(key_hex)!
-	iv := hex_to_bytes(iv_hex)!
-	nonce := iv[0..12]
-	return chacha20.encrypt(key, nonce, header_bytes)!
-}
-
-fn openssl_decrypt_header(enc_header_bytes []u8, key_hex string, iv_hex string) ![]u8 {
-	key := hex_to_bytes(key_hex)!
-	iv := hex_to_bytes(iv_hex)!
-	nonce := iv[0..12]
-	return chacha20.decrypt(key, nonce, enc_header_bytes)!
-}
-
-fn encrypt_chunk(chunk_data []u8, key []u8, iv []u8, chunk_index u64, use_compression bool) ![]u8 {
-	mut data := chunk_data.clone()
-	if use_compression {
-		data = zstd.compress(data)!
-	}
-	mut chunk_nonce := []u8{len: 12, init: 0}
-	for i in 0 .. 4 { chunk_nonce[i] = iv[i] }
-	write_u64_to_buf(mut chunk_nonce, chunk_index, 4)
-	return chacha20poly1305.encrypt(data, key, chunk_nonce, []u8{})!
-}
-
-fn decrypt_chunk(cipher_bytes []u8, key []u8, iv []u8, chunk_index u64, use_compression bool) ![]u8 {
-	mut chunk_nonce := []u8{len: 12, init: 0}
-	for i in 0 .. 4 { chunk_nonce[i] = iv[i] }
-	write_u64_to_buf(mut chunk_nonce, chunk_index, 4)
-	mut decrypted := chacha20poly1305.decrypt(cipher_bytes, key, chunk_nonce, []u8{}) or {
-		return error('Chunk decryption failed')
-	}
-	if use_compression {
-		decrypted = zstd.decompress(decrypted)!
-	}
-	return decrypted
-}
-
-fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64,
-password string, seed0_str string, seed1_str string, seed2_str string, mem u32, iter u32, threads
-u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! { 
-	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') } 
-
-	mut infile := os.open(file_path)!
-	defer { infile.close() }
-	mut outfile := os.create(out_path)!
-	defer { outfile.close() }
-
-	file_salt := secure_random_bytes(32)!
-	outfile.write(file_salt)!
-
-	mut w_trapdoor_bytes := []u8{}
-
-	mut t_val := duration_sec
-	if t_val < 2 { t_val = 2 }
-
-	println(term.green('[+] VDF config -> Interleaved Memory-Hard Sequential SHA3-512 Chain (t = ${t_val})'))
-
-	mut data_a := []u8{cap: password.len + file_salt.len}
-	for b in password.bytes() { data_a << b }
-	for b in file_salt { data_a << b }
-	initial_state := sha3.sum512(data_a)
-
-	println(term.cyan('[*] Computing sequential SHA3 chain. Please wait...'))
-	w_trapdoor_bytes = run_sequential_delay(initial_state, t_val, true)
-	lock_memory(mut w_trapdoor_bytes)
-	defer { unlock_memory(mut w_trapdoor_bytes); zeroize(mut w_trapdoor_bytes) }
-	
-	mut header_key_material := []u8{cap: password.len + w_trapdoor_bytes.len}
-	for b in password.bytes() { header_key_material << b }
-	for b in w_trapdoor_bytes { header_key_material << b }
-	
-	header_key_iv := pbkdf2_sha3_512(header_key_material, file_salt, pbkdf2_iter, 48)
-	header_key := header_key_iv[0..32].hex()
-	header_iv := header_key_iv[32..48].hex()
-
-	mut session_key := secure_random_bytes(32)!
-	lock_memory(mut session_key)
-	defer { unlock_memory(mut session_key); zeroize(mut session_key) }
-
-	mut session_iv := secure_random_bytes(16)!
-	lock_memory(mut session_iv)
-	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
-
-	mut seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
-	defer { unlock_memory(mut seed_bytes1); zeroize(mut seed_bytes1) }
-
-	mut seed_bytes2 := derive_seed2(seed2_str, w_trapdoor_bytes, pbkdf2_iter)!
-	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
-
-	chunk_size := 1024 * 1024
-	mut first_chunk_buf := []u8{len: chunk_size}
-	n_read := infile.read(mut first_chunk_buf) or { 0 }
-	mut first_chunk_raw := []u8{}
-	if n_read > 0 { first_chunk_raw = first_chunk_buf[0..n_read].clone() }
-
-	first_chunk_cipher := encrypt_chunk(first_chunk_raw, session_key, session_iv, 0, use_compression)!
-
-	mut key_ciphertext := []u8{}
-	
-	mut argon_key := argon2.d_key(password.bytes(), file_salt, iter, mem, threads, 48)!
-	lock_memory(mut argon_key)
-	defer { unlock_memory(mut argon_key); zeroize(mut argon_key) }
-
-	w_trapdoor_hash := sha3.sum512(w_trapdoor_bytes)
-	w_mask := w_trapdoor_hash[0..48]
-	mut final_key_bytes := xor_bytes(argon_key, w_mask)
-	lock_memory(mut final_key_bytes)
-	defer { unlock_memory(mut final_key_bytes); zeroize(mut final_key_bytes) }
-
-	mut session_key_iv := []u8{cap: 48}
-	for byte in session_key { session_key_iv << byte }
-	for byte in session_iv { session_key_iv << byte }
-	key_ciphertext = xor_bytes(session_key_iv, final_key_bytes)
-
-	mut key_seed0_salt := []u8{cap: file_salt.len + 8}
-	for b in file_salt { key_seed0_salt << b }
-	for b in "seed0key".bytes() { key_seed0_salt << b }
-	
-	mut key_seed0 := argon2.d_key(seed0_str.bytes(), key_seed0_salt, 3, 32768, 2, 32)!
-	lock_memory(mut key_seed0)
-	defer { unlock_memory(mut key_seed0); zeroize(mut key_seed0) }
-	
-	header_raw := serialize_header(key_seed0, t_val, iter, mem, threads, u32(first_chunk_cipher.len), use_compression, key_ciphertext)
-	encrypted_header := openssl_encrypt_header(header_raw, header_key, header_iv)!
-	
-	mut meta := []u8{}
-	write_u32(mut meta, u32(encrypted_header.len))
-	for b in encrypted_header { meta << b }
-
-	data_len := meta.len + first_chunk_cipher.len
-	mut total_len := data_len * 2
-	
-	if total_len < 262144 {
-		total_len = 262144
-	}
-	
-	mut mixed := []u8{len: total_len}
-	mut mixed_seed := []u8{cap: 128}
-	for b in seed_bytes1 { mixed_seed << b }
-	for b in seed_bytes2 { mixed_seed << b }
-	mut junk_rng := SecurePRNG{seed: mixed_seed}
-	for i in 0 .. total_len { mixed[i] = u8(junk_rng.next_u8() & 0xFF) }
-
-	mut all_indices := []int{len: total_len}
-	for i in 0 .. total_len { all_indices[i] = i }
-	mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
-	for i := total_len - 1; i > 0; i-- {
-		j := shuffle_rng1.intn(i + 1)
-		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
-	}
-
-	meta_len := meta.len
-	mut meta_indices := []int{cap: meta_len}
-	for i in 0 .. meta_len { meta_indices << all_indices[i] }
-	for i in 0 .. meta_len { mixed[meta_indices[i]] = meta[i] }
-
-	mut remaining_indices := []int{cap: total_len - meta_len}
-	for i in meta_len .. total_len { remaining_indices << all_indices[i] }
-	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
-	for i := remaining_indices.len - 1; i > 0; i-- {
-		j := shuffle_rng2.intn(i + 1)
-		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
-	}
-	for i in 0 .. first_chunk_cipher.len { mixed[remaining_indices[i]] = first_chunk_cipher[i] }
-
-	mut mask_input := []u8{cap: password.len + file_salt.len}
-	for b in password.bytes() { mask_input << b }
-	for b in file_salt { mask_input << b }
-	mask_stream := sha3.sum512(mask_input)
-
-	mut mixed_size_buf := []u8{}
-	write_u32(mut mixed_size_buf, u32(mixed.len))
-
-	mut masked_mixed_size := []u8{len: 4}
-	for i in 0 .. 4 {
-		masked_mixed_size[i] = mixed_size_buf[i] ^ mask_stream[i]
-	}
-
-	outfile.write(masked_mixed_size)!
-	outfile.write(mixed)!
-
-	mut chunk_index := u64(1)
-	mut buf := []u8{len: chunk_size}
-	for {
-		n_chunk := infile.read(mut buf) or { 0 }
-		if n_chunk <= 0 { break }
-		chunk_data := buf[0..n_chunk].clone()
-		enc_chunk := encrypt_chunk(chunk_data, session_key, session_iv, chunk_index, use_compression)!
-
-		mut chunk_mask_input := []u8{cap: session_key.len + session_iv.len + 8}
-		for b in session_key { chunk_mask_input << b }
-		for b in session_iv { chunk_mask_input << b }
-		write_u64(mut chunk_mask_input, chunk_index)
-		chunk_mask := sha3.sum512(chunk_mask_input)
-
-		mut len_buf := []u8{}
-		write_u32(mut len_buf, u32(enc_chunk.len))
-
-		mut masked_len_buf := []u8{len: 4}
-		for i in 0 .. 4 {
-			masked_len_buf[i] = len_buf[i] ^ chunk_mask[i]
-		}
-
-		outfile.write(masked_len_buf)!
-		outfile.write(enc_chunk)!
-		chunk_index++
-	}
-
-	infile.close()
-	outfile.close()
-	
-	println(term.green('[+] Binary file saved to: ${out_path}'))
-	if shred_orig {
-		println(term.yellow('[*] Securely shredding original file: ${file_path}...'))
-		secure_shred_file(file_path)
-	}
-}
-
-fn locktime_decrypt_flow(file_path string, out_path string, duration_sec u64, password string,
-seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int, shred_orig bool) ! { 
-	if !os.exists(file_path) { return error('Input file does not exist: ${file_path}') } 
-	if os.exists(out_path) { os.rm(out_path) or {} }
-
-	mut infile := os.open(file_path)!
-	defer { infile.close() }
-	mut outfile := os.create(out_path)!
-	defer { outfile.close() }
-
-	println(term.cyan('[*] Reading binary file...'))
-	mut file_salt := []u8{len: 32}
-	n_salt := infile.read(mut file_salt)!
-	if n_salt < 32 { return error('File too small to contain a salt!') }
-
-	mut mask_input := []u8{cap: password.len + file_salt.len}
-	for b in password.bytes() { mask_input << b }
-	for b in file_salt { mask_input << b }
-	mask_stream := sha3.sum512(mask_input)
-	
-	mut t_val := duration_sec
-	if t_val < 2 { t_val = 2 }
-	
-	mut data_a := []u8{cap: password.len + file_salt.len}
-	for b in password.bytes() { data_a << b }
-	for b in file_salt { data_a << b }
-	initial_state := sha3.sum512(data_a)
-
-	println(term.cyan('[*] Computing SHA3 delay chain (t = ${t_val}). Please wait...'))
-	start_time := time.now()
-	
-	mut x_bytes := run_sequential_delay(initial_state, t_val, true)
-	lock_memory(mut x_bytes)
-	defer { unlock_memory(mut x_bytes); zeroize(mut x_bytes) }
-	println(term.green('[+] Sequential VDF complete in ${time.since(start_time).seconds():.2f} seconds.'))
-	
-	mut masked_mixed_size := []u8{len: 4}
-	n_size := infile.read(mut masked_mixed_size)!
-	if n_size < 4 { return error('File too small to contain mixed size!') }
-
-	mut mixed_size_buf := []u8{len: 4}
-	for i in 0 .. 4 {
-		mixed_size_buf[i] = masked_mixed_size[i] ^ mask_stream[i]
-	}
-	mixed_len := read_u32(mixed_size_buf, 0)
-
-	if mixed_len > 100 * 1024 * 1024 {
-		return error('Invalid mixed size parsed (wrong password or corrupted file).')
-	}
-
-	mut mixed := []u8{len: int(mixed_len)}
-	n_mixed := infile.read(mut mixed)!
-	if n_mixed < int(mixed_len) { return error('Failed to read interleaved block!') }
-
-	total_len := mixed.len
-	mut seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
-	defer { unlock_memory(mut seed_bytes1); zeroize(mut seed_bytes1) }
-
-	mut all_indices := []int{len: total_len}
-	for i in 0 .. total_len { all_indices[i] = i }
-	mut shuffle_rng1 := SecurePRNG{seed: seed_bytes1}
-	for i := total_len - 1; i > 0; i-- {
-		j := shuffle_rng1.intn(i + 1)
-		all_indices[i], all_indices[j] = all_indices[j], all_indices[i]
-	}
-
-	mut meta_prefix := []u8{len: 4}
-	for i in 0 .. 4 { meta_prefix[i] = mixed[all_indices[i]] }
-	enc_header_len := read_u32(meta_prefix, 0)
-
-	mut safe_enc_header_len := int(enc_header_len)
-	mut rem_space := total_len - 4
-	if rem_space < 2 { rem_space = 2 }
-	if safe_enc_header_len <= 0 || safe_enc_header_len > rem_space {
-		safe_enc_header_len = rem_space
-	}
-	meta_total_len := 4 + safe_enc_header_len
-
-	mut enc_header_bytes := []u8{len: safe_enc_header_len}
-	for i in 0 .. safe_enc_header_len {
-		idx := 4 + i
-		if idx >= 0 && idx < all_indices.len {
-			enc_header_bytes[i] = mixed[all_indices[idx]]
-		}
-	}
-	
-	mut header_key_material := []u8{cap: password.len + x_bytes.len}
-	for b in password.bytes() { header_key_material << b }
-	for b in x_bytes { header_key_material << b }
-
-	header_key_iv := pbkdf2_sha3_512(header_key_material, file_salt, pbkdf2_iter, 48)
-	header_key := header_key_iv[0..32].hex()
-	header_iv := header_key_iv[32..48].hex()
-
-	dec_header_bytes := openssl_decrypt_header(enc_header_bytes, header_key, header_iv)!
-
-	mut key_seed0_salt := []u8{cap: file_salt.len + 8}
-	for b in file_salt { key_seed0_salt << b }
-	for b in "seed0key".bytes() { key_seed0_salt << b }
-	
-	mut key_seed0 := argon2.d_key(seed0_str.bytes(), key_seed0_salt, 3, 32768, 2, 32)!
-	lock_memory(mut key_seed0)
-	defer { unlock_memory(mut key_seed0); zeroize(mut key_seed0) }
-	
-	header := deserialize_header(dec_header_bytes, key_seed0, file_salt)!
-
-	mut cipher_len := header.cipher_len
-	mut remaining_indices := []int{cap: if total_len > meta_total_len { total_len - meta_total_len } else { 0 }}
-	if total_len > meta_total_len {
-		for i in meta_total_len .. total_len { remaining_indices << all_indices[i] }
-	}
-	mut safe_cipher_len := int(cipher_len)
-	max_cipher := remaining_indices.len
-	if safe_cipher_len <= 0 || safe_cipher_len > max_cipher { safe_cipher_len = max_cipher }
-
-	mut session_key := []u8{}
-	mut session_iv := []u8{}
-	
-	mut argon_key := argon2.d_key(password.bytes(), header.salt, header.iter, header.mem, header.threads, 48) or { []u8{len: 48} }
-	lock_memory(mut argon_key)
-	defer { unlock_memory(mut argon_key); zeroize(mut argon_key) }
-
-	w_hash := sha3.sum512(x_bytes)
-	w_mask := w_hash[0..48]
-	mut final_key_bytes := xor_bytes(argon_key, w_mask)
-	lock_memory(mut final_key_bytes)
-	defer { unlock_memory(mut final_key_bytes); zeroize(mut final_key_bytes) }
-
-	if header.key_ciphertext.len != 48 { return error('Malformed classic header ciphertext length') }
-	dec_key_iv := xor_bytes(header.key_ciphertext, final_key_bytes)
-
-	session_key = dec_key_iv[0..32].clone()
-	lock_memory(mut session_key)
-	defer { unlock_memory(mut session_key); zeroize(mut session_key) }
-
-	session_iv = dec_key_iv[32..48].clone()
-	lock_memory(mut session_iv)
-	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
-
-	mut seed_bytes2 := derive_seed2(seed2_str, x_bytes, pbkdf2_iter)!
-	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
-
-	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
-	for i := remaining_indices.len - 1; i > 0; i-- {
-		j := shuffle_rng2.intn(i + 1)
-		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
-	}
-
-	mut first_chunk_cipher := []u8{len: safe_cipher_len}
-	for i in 0 .. safe_cipher_len {
-		if i >= 0 && i < remaining_indices.len {
-			idx := remaining_indices[i]
-			if idx >= 0 && idx < mixed.len { first_chunk_cipher[i] = mixed[idx] }
-		}
-	}
-
-	println(term.cyan('[*] Decrypting payload chunks...'))
-	first_chunk_raw := decrypt_chunk(first_chunk_cipher, session_key, session_iv, 0, header.use_compression) or {
-		return error('First chunk decryption failed. Data corrupted or wrong parameters.')
-	}
-	outfile.write(first_chunk_raw)!
-
-	mut chunk_index := u64(1)
-	for {
-		mut masked_len_buf := []u8{len: 4}
-		n_len := infile.read(mut masked_len_buf) or { 0 }
-		if n_len < 4 { break }
-
-		mut chunk_mask_input := []u8{cap: session_key.len + session_iv.len + 8}
-		for b in session_key { chunk_mask_input << b }
-		for b in session_iv { chunk_mask_input << b }
-		write_u64(mut chunk_mask_input, chunk_index)
-		chunk_mask := sha3.sum512(chunk_mask_input)
-
-		mut chunk_len_buf := []u8{len: 4}
-		for i in 0 .. 4 {
-			chunk_len_buf[i] = masked_len_buf[i] ^ chunk_mask[i]
-		}
-		enc_len := read_u32(chunk_len_buf, 0)
-
-		if enc_len > 10 * 1024 * 1024 {
-			return error('Invalid chunk length decoded (possibly wrong password or corrupted file).')
-		}
-		
-		mut enc_chunk := []u8{len: int(enc_len)}
-		n_chunk := infile.read(mut enc_chunk)!
-		if n_chunk < int(enc_len) { return error('Malformed file: truncated chunk!') }
-		
-		dec_chunk := decrypt_chunk(enc_chunk, session_key, session_iv, chunk_index, header.use_compression)!
-		outfile.write(dec_chunk)!
-		chunk_index++
-	}
-
-	infile.close()
-	outfile.close()
-	
-	println(term.green('[+] Decrypted file saved to: ${out_path}'))
-	if shred_orig {
-		println(term.yellow('[*] Securely shredding encrypted carrier file: ${file_path}...'))
-		secure_shred_file(file_path)
-	}
-}
-
-fn print_help() {
-	println(term.bold(term.cyan('Usage: locktime/salty [mode] [options]')))
-	println('\nModes:')
-	println('  encrypt                    Encrypt a file (Locktime) or steganographic message (Salty)')
-	println('  decrypt                    Decrypt a file (Locktime) or steganographic carrier (Salty)')
-	println('  obfuscate                  Apply visual homoglyphs/noise mapping (Salty)')
-	println('  interactive                Run Salty interactive stego menu')
-	println('\nLocktime (Time-Lock Encryption) Options:')
-	println('  -f, --file <path>          Input file to encrypt/decrypt')
-	println('  -o, --out <path>           Output file path')
-	println('  -t, --time <iterations>    Direct VDF iteration count (Required for both Enc/Dec, Default: 100000)')
-	println('  -p, --pass <password>      Master password for ChaCha20/Header encryption')
-	println('  -s0, --seed0 <str>         Independent password/seed to map and lock VDF metadata')
-	println('  -s1, --seed1 <str>         Independent password/seed to map the VDF blocks')
-	println('  -s2, --seed2 <str>         Independent password/seed to map the payload blocks')
-	println('  -sh, --shred               Securely shred the original input file after successful execution')
-	println('  -c, --compress             Enable compression (In-memory zstd)')
-	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
-	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
-	println('  --threads <count>          Argon2 Threads (Default: 4)')
-	println('  --pbkdf2-iter <count>      PBKDF2 iterations for structural key stretching (Default: 200000)')
-	println('\nSalty Steganography Options:')
-	println('  -m, --message <str>        Plaintext message to hide')
-	println('  -t, --text <str>           Cover text (for encrypt) or carrier text (for decrypt)')
-	println('  -r, --ref <str>            Original Reference text (Required for Overwrite/Transpose Dec)')
-	println('  -p, --pass <password>      Cryptographic password')
-	println('  -s, --seed <str>           Deterministic RNG seed for positions and choices')
-	println('  -f, --formats <str>        Layouts for Number Mode (e.g., "+98912:7,6037:10")')
-	println('  -ti, --typo-intensity <n>  Typo/Swap frequency percentage (1-100)')
-	println('  -tc, --typo-chars <str>    Custom typo letters')
-	println('  -km, --key-map <str>       Custom keyboard map')
-	println('  -q, --qwerty               Standard US-QWERTY proximity logic')
-	println('  -o, --overwrite            Overwrites characters instead of inserting')
-	println('  -tr, --transpose           Swaps adjacent letters instead of replacing them')
-	println('  -c, --compress             Enable compression (In-memory zstd)')
-}
-
 fn run_salty_interactive() ! {
-	println(term.bold(term.cyan('=== SALTY INTERACTIVE MODE ===')))
-	method := os.input('Choose Carrier Method (1: Fake Numbers, 2: Text Typos, 3: Custom Manual Obfuscation): ').trim_space()
+	println(term.gray('salty: active interactive mode'))
+	method := os.input('Choose Carrier Method (1: Fake Numbers, 2: Text Typos, 3: Custom Manual Obfuscation, 4: RAM Virtual Mount Container): ').trim_space()
+	if method == '4' {
+		file_path := os.input('Enter container file path (e.g. secure.container): ').trim_space()
+		mut is_new := false
+		if !os.exists(file_path) {
+			ans := os.input('Container file does not exist. Create a new empty container? (y/n): ').trim_space().to_lower()
+			if ans == 'y' { is_new = true } else { return }
+		}
+		password := os.input_password('Enter Master Password: ')!
+		seed0_str := os.input_password('Enter Seed 0 (Header Key): ')!
+		seed1_str := os.input_password('Enter Seed 1 (VDF Key): ')!
+		seed2_str := os.input_password('Enter Seed 2 (Payload Key): ')!
+		duration_str := os.input('Enter Time Lock iterations (default 100000): ').trim_space()
+		duration := if duration_str == '' { u64(100000) } else { duration_str.u64() }
+		compress_ans := os.input('Use compression? (y/n): ').trim_space().to_lower()
+		use_compression := compress_ans == 'y'
+		run_mount_flow(file_path, duration, password, seed0_str, seed1_str, seed2_str, 65536, 3, 4, 200000, use_compression)!
+		return
+	}
 	if method == '1' || method == '2' {
 		mode := os.input('Choose Action (1: Encrypt, 2: Decrypt): ').trim_space()
 		password := os.input_password('Enter Password: ')!
@@ -1515,46 +2013,91 @@ fn run_salty_interactive() ! {
 		noise_chars := get_noise_chars(nc_str)
 		if mode_obf == '2' {
 			result := apply_deobfuscation(text_input, m, noise_chars)
-			println('\n' + term.bold(term.green('=== DE-OBFUSCATED TEXT ===\n' + result)))
+			println('\nsalty: deobfuscated text:')
+			println(result)
 		} else {
 			result := apply_obfuscation(text_input, m, noise_int, noise_chars, seed_str)
-			println('\n' + term.bold(term.green('=== OBFUSCATED TEXT ===\n' + result)))
+			println('\nsalty: obfuscated text:')
+			println(result)
 		}
 	}
 }
 
+fn print_help() {
+	println('Usage: salty [mode] [options]')
+	println('\nModes:')
+	println('  encrypt                    Encrypt a folder/file (Locktime) or hide message (Salty stego)')
+	println('  decrypt                    Decrypt a container (Locktime) or extract message (Salty stego)')
+	println('  mount                      Mount container into dedicated ./mnt/<container>_salty path')
+	println('  unmount                    Unmount and clean up an orphan mount point')
+	println('  obfuscate                  Apply visual homoglyphs and noise mappings')
+	println('  interactive                Run Salty interactive stego menu')
+	println('\nOptions:')
+	println('  -f, --file <path>          Input folder or container file path')
+	println('  -o, --out <path>           Output container file or decrypted folder path')
+	println('  -t, --time <iterations>    VDF sequential delay chain iteration count (Default: 100000)')
+	println('  -p, --pass <password>      Master password for cryptographic protection')
+	println('  -s0, --seed0 <str>         Independent seed for VDF metadata mapping')
+	println('  -s1, --seed1 <str>         Independent seed for VDF block layout')
+	println('  -s2, --seed2 <str>         Independent seed for payload permutation')
+	println('  -sh, --shred               Securely shred the original source after execution')
+	println('  -c, --compress             Enable in-memory zstd compression')
+	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
+	println('  --iter <iterations>        Argon2 Iterations (Default: 3)')
+	println('  --threads <count>          Argon2 Threads (Default: 4)')
+	println('  --pbkdf2-iter <count>      PBKDF2 iteration count (Default: 200000)')
+	println('\nSalty Steganography Options:')
+	println('  -m, --message <str>        Plaintext message to hide')
+	println('  -t, --text <str>           Cover text (for encrypt) or carrier text (for decrypt)')
+	println('  -r, --ref <str>            Original Reference text (Required for Overwrite/Transpose Dec)')
+	println('  -p, --pass <password>      Cryptographic password')
+	println('  -s, --seed <str>           Deterministic RNG seed for positions and choices')
+	println('  -f, --formats <str>        Layouts for Number Mode (e.g., "+98912:7,6037:10")')
+	println('  -ti, --typo-intensity <n>  Typo/Swap frequency percentage (1-100)')
+	println('  -tc, --typo-chars <str>    Custom typo letters')
+	println('  -km, --key-map <str>       Custom keyboard map')
+	println('  -q, --qwerty               Standard US-QWERTY proximity logic')
+	println('  -o, --overwrite            Overwrites characters instead of inserting')
+	println('  -tr, --transpose           Swaps adjacent letters instead of replacing them')
+}
+
 fn main() {
+	register_signals()
+	check_mlock_capability()
+
 	args := os.args
-	if args.len == 1 {
-		run_salty_interactive() or { println(term.red('Error: ${err}')) }
-		return
-	}
-	if '-h' in args || '--help' in args {
+	if args.len == 1 || '-h' in args || '--help' in args {
 		print_help()
 		return
 	}
 	mode := args[1]
 	if mode == 'interactive' {
-		run_salty_interactive() or { println(term.red('Error: ${err}')) }
+		run_salty_interactive() or { eprintln('error: interactive mode failed: ${err}') }
 		return
 	}
-	if mode != 'encrypt' && mode != 'decrypt' && mode != 'obfuscate' {
-		println(term.red('Error: Mode must be "encrypt", "decrypt" or "obfuscate"'))
+	if mode != 'encrypt' && mode != 'decrypt' && mode != 'mount' && mode != 'unmount' && mode != 'obfuscate' {
+		eprintln('error: mode must be "encrypt", "decrypt", "mount", "unmount", "obfuscate" or "interactive"')
 		print_help()
 		return
 	}
+
 	mut is_locktime := false
-	for a in args {
-		if a in ['--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s0', '--seed0', '-s1', '--seed1', '-s2', '--seed2'] {
-			is_locktime = true
-			break
+	if mode in ['mount', 'unmount'] {
+		is_locktime = true
+	} else {
+		for a in args {
+			if a in ['--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s0', '--seed0', '-s1', '--seed1', '-s2', '--seed2'] {
+				is_locktime = true
+				break
+			}
+		}
+		if !is_locktime {
+			if '-f' in args && '-o' in args {
+				is_locktime = true
+			}
 		}
 	}
-	if !is_locktime {
-		if '-f' in args && '-o' in args {
-			is_locktime = true
-		}
-	}
+
 	mut file_path := ''
 	mut out_path := ''
 	mut duration := u64(100000)
@@ -1583,12 +2126,13 @@ fn main() {
 	mut deobfuscate := false
 	mut noise_intensity := 0
 	mut noise_chars_str := ''
+
 	if is_locktime {
 		for i := 2; i < args.len; i++ {
 			match args[i] {
-				'-f' { if i + 1 < args.len { file_path = args[i+1]; i++ } }
-				'-o' { if i + 1 < args.len { out_path = args[i+1]; i++ } }
-				'-t' { if i + 1 < args.len { duration = args[i+1].u64(); i++ } }
+				'-f', '--file' { if i + 1 < args.len { file_path = args[i+1]; i++ } }
+				'-o', '--out' { if i + 1 < args.len { out_path = args[i+1]; i++ } }
+				'-t', '--time' { if i + 1 < args.len { duration = args[i+1].u64(); i++ } }
 				'-p', '--pass' { if i + 1 < args.len { password = args[i+1]; i++ } }
 				'-s0', '--seed0' { if i + 1 < args.len { seed0_str = args[i+1]; i++ } }
 				'-s1', '--seed1' { if i + 1 < args.len { seed1_str = args[i+1]; i++ } }
@@ -1602,6 +2146,21 @@ fn main() {
 				else {}
 			}
 		}
+
+		if file_path == '' {
+			eprintln('error: input path (-f or --file) is required')
+			return
+		}
+
+		if mode == 'unmount' {
+			execute_unmount(file_path, '') or {
+				eprintln('error: unmount failed: ${err}')
+				return
+			}
+			println('salty: cleaned up mount point: "${file_path}"')
+			return
+		}
+
 		if password == '' {
 			password = os.input_password('Enter Master Password: ') or { panic(err) }
 		}
@@ -1614,13 +2173,26 @@ fn main() {
 		if seed2_str == '' {
 			seed2_str = os.input_password('Enter Seed 2 (Payload Key): ') or { panic(err) }
 		}
+
 		if mode == 'encrypt' {
+			if out_path == '' {
+				eprintln('error: output container path (-o or --out) is required for encryption')
+				return
+			}
 			locktime_encrypt_flow(file_path, out_path, duration, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, shred_orig, use_compression) or {
-				println(term.red('[-] Encryption Error: ${err}'))
+				eprintln('error: encryption failed: ${err}')
 			}
 		} else if mode == 'decrypt' {
+			if out_path == '' {
+				eprintln('error: output directory path (-o or --out) is required for decryption')
+				return
+			}
 			locktime_decrypt_flow(file_path, out_path, duration, password, seed0_str, seed1_str, seed2_str, pbkdf2_iter, shred_orig) or {
-				println(term.red('[-] Decryption Error: ${err}'))
+				eprintln('error: decryption failed: ${err}')
+			}
+		} else if mode == 'mount' {
+			run_mount_flow(file_path, duration, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, use_compression) or {
+				eprintln('error: mount failed: ${err}')
 			}
 		}
 	} else {
@@ -1650,51 +2222,53 @@ fn main() {
 		}
 		if mode == 'obfuscate' {
 			if text_input == '' {
-				println(term.red('Error: Text is required (-t or --text)'))
+				eprintln('error: text is required (-t or --text)')
 				return
 			}
 			if mapping_str == '' {
-				println(term.red('Error: Mapping string is required (-map or --mapping)'))
+				eprintln('error: mapping string is required (-map or --mapping)')
 				return
 			}
 			m := parse_mapping(mapping_str)
 			noise_chars := get_noise_chars(noise_chars_str)
 			if deobfuscate {
 				result := apply_deobfuscation(text_input, m, noise_chars)
-				println(term.bold(term.green('=== DE-OBFUSCATED TEXT ===\n' + result)))
+				println('salty: deobfuscated text:')
+				println(result)
 			} else {
 				result := apply_obfuscation(text_input, m, noise_intensity, noise_chars, seed_val)
-				println(term.bold(term.green('=== OBFUSCATED TEXT ===\n' + result)))
+				println('salty: obfuscated text:')
+				println(result)
 			}
 			return
 		}
 		if password == '' {
-			println(term.red('Error: Password is required (-p or --pass)'))
+			eprintln('error: password is required (-p or --pass)')
 			return
 		}
 		if raw_formats != '' {
 			formats := parse_formats(raw_formats) or {
-				println(term.red('Format parse error: ${err}'))
+				eprintln('error: format parse error: ${err}')
 				return
 			}
 			if mode == 'encrypt' {
-				if message == '' { println(term.red('Error: Message required (-m)')); return }
-				encrypt_number_flow(message, password, seed_val, formats, use_compression) or { println(term.red('Encryption failed: ${err}')) }
+				if message == '' { eprintln('error: message required (-m)'); return }
+				encrypt_number_flow(message, password, seed_val, formats, use_compression) or { eprintln('error: encryption failed: ${err}') }
 			} else {
-				if text_input == '' { println(term.red('Error: Carrier text required (-t)')); return }
-				decrypt_number_flow(text_input, password, seed_val, formats, use_compression) or { println(term.red('Decryption failed: ${err}')) }
+				if text_input == '' { eprintln('error: carrier text required (-t)'); return }
+				decrypt_number_flow(text_input, password, seed_val, formats, use_compression) or { eprintln('error: decryption failed: ${err}') }
 			}
 		} else if typo_intensity > 0 {
 			if mode == 'encrypt' {
-				if message == '' { println(term.red('Error: Message required (-m)')); return }
-				if text_input == '' { println(term.red('Error: Cover text required (-t)')); return }
-				encrypt_text_stego(message, text_input, password, seed_val, typo_intensity, typo_chars.str(), key_map, use_qwerty, overwrite, transpose, use_compression) or { println(term.red('Encryption failed: ${err}')) }
+				if message == '' { eprintln('error: message required (-m)'); return }
+				if text_input == '' { eprintln('error: cover text required (-t)'); return }
+				encrypt_text_stego(message, text_input, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite, transpose, use_compression) or { eprintln('error: encryption failed: ${err}') }
 			} else {
-				if text_input == '' { println(term.red('Error: Carrier text required (-t)')); return }
-				decrypt_text_stego(text_input, ref_text, password, seed_val, typo_intensity, typo_chars.str(), key_map, use_qwerty, overwrite, transpose, use_compression) or { println(term.red('Decryption failed: ${err}')) }
+				if text_input == '' { eprintln('error: carrier text required (-t)'); return }
+				decrypt_text_stego(text_input, ref_text, password, seed_val, typo_intensity, typo_chars, key_map, use_qwerty, overwrite, transpose, use_compression) or { eprintln('error: decryption failed: ${err}') }
 			}
 		} else {
-			println(term.red('Error: You must provide either --formats (for Number Mode) or --typo-intensity (for Text Mode).'))
+			eprintln('error: provide --formats (for Number Mode) or --typo-intensity (for Text Mode)')
 			print_help()
 		}
 	}
