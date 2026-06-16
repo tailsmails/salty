@@ -30,7 +30,120 @@ fn C.snprintf(str &char, size usize, format &char, ... ) int
 __global (
 	g_active_mount_point string
 	g_active_safe_erp string
+	g_is_termux_api_cached bool
+	g_has_termux_api bool
 )
+
+fn check_android_and_termux_api() bool {
+	if !os.exists('/system/bin/pm') && !os.exists('/system/bin/cmd') {
+		return false
+	}
+	
+	if !os.exists('/data/data/com.termux') {
+		return false
+	}
+	
+	termux_api_path := os.find_abs_path_of_executable('termux-battery-status') or { '' }
+	if termux_api_path == '' {
+		return false
+	}
+	
+	pm_res := os.execute('timeout 3 pm list packages com.termux.api')
+	if pm_res.exit_code != 0 || !pm_res.output.contains('com.termux.api') {
+		return false
+	}
+
+	return true
+}
+
+fn run_termux_cmd(cmd string, is_root bool, uid string) os.Result {
+	if is_root && uid != '' {
+		return os.execute('timeout 2 su ${uid} -c "${cmd}" < /dev/null')
+	}
+	return os.execute('timeout 2 ${cmd}')
+}
+
+fn gather_termux_entropy() ![]u8 {
+	mut entropy_pool := []u8{}
+
+	mut is_root := false
+	$if !windows {
+		is_root = C.getuid() == 0
+	}
+	mut uid := ''
+
+	if is_root {
+		u_raw := os.execute('stat -c %u /data/data/com.termux 2>/dev/null')
+		if u_raw.exit_code == 0 {
+			uid = u_raw.output.trim_space()
+		}
+	}
+
+	bat_res := run_termux_cmd('termux-battery-status', is_root, uid)
+	if bat_res.exit_code == 0 {
+		for b in bat_res.output.bytes() {
+			entropy_pool << b
+		}
+	}
+
+	loc_res := run_termux_cmd('termux-location -p last', is_root, uid)
+	if loc_res.exit_code == 0 {
+		for b in loc_res.output.bytes() {
+			entropy_pool << b
+		}
+	}
+
+	wifi_res := run_termux_cmd('termux-wifi-connectioninfo', is_root, uid)
+	if wifi_res.exit_code == 0 {
+		for b in wifi_res.output.bytes() {
+			entropy_pool << b
+		}
+	}
+
+	sensors := ['MAGNETOMETER', 'ACCELEROMETER', 'GYROSCOPE']
+	for sensor in sensors {
+		sensor_cmd := 'termux-sensor -s ${sensor} -n 1'
+		res := run_termux_cmd(sensor_cmd, is_root, uid)
+		if res.exit_code == 0 && res.output.contains('"values":') {
+			raw_vals := res.output.all_after('"values": [').all_before(']')
+			for b in raw_vals.bytes() {
+				entropy_pool << b
+			}
+		}
+	}
+
+	now := time.now().unix_nano()
+	mut now_bytes := []u8{len: 8}
+	write_u64_to_buf(mut now_bytes, u64(now), 0)
+	for b in now_bytes {
+		entropy_pool << b
+	}
+
+	pid := os.getpid()
+	mut pid_bytes := []u8{len: 4}
+	pid_bytes[0] = u8(pid >> 24)
+	pid_bytes[1] = u8(pid >> 16)
+	pid_bytes[2] = u8(pid >> 8)
+	pid_bytes[3] = u8(pid)
+	for b in pid_bytes {
+		entropy_pool << b
+	}
+
+	if os.exists('/dev/urandom') {
+		mut f := os.open('/dev/urandom') or { return entropy_pool }
+		defer { f.close() }
+		mut buf := []u8{len: 64}
+		n := f.read(mut buf) or { 0 }
+		if n > 0 {
+			for i in 0 .. n {
+				entropy_pool << buf[i]
+			}
+		}
+	}
+
+	hashed_seed := sha3.sum512(entropy_pool)
+	return hashed_seed.clone()
+}
 
 fn signal_handler(sig int) {
 	unsafe {
@@ -58,8 +171,7 @@ fn signal_handler(sig int) {
 			C.snprintf(&char(&cmd_buf), 512, c'umount -l %s 2>/dev/null', &char(&erp_buf))
 			C.system(&char(&cmd_buf))
 			
-			C.snprintf(&char(&cmd_buf), 512, c'rm -rf %s 2>/dev/null', &char(&erp_buf))
-			C.system(&char(&cmd_buf))
+			C.rmdir(&char(&erp_buf))
 		}
 		
 		C.exit(1)
@@ -288,6 +400,40 @@ fn new_secure_prng_from_string(seed_str string) SecurePRNG {
 }
 
 fn secure_random_bytes(size int) ![]u8 {
+	mut use_termux_api := false
+	unsafe {
+		if !g_is_termux_api_cached {
+			g_has_termux_api = check_android_and_termux_api()
+			g_is_termux_api_cached = true
+		}
+		use_termux_api = g_has_termux_api
+	}
+
+	if use_termux_api {
+		mut seed := gather_termux_entropy() or {
+			return secure_random_bytes_fallback(size)
+		}
+		lock_memory(mut seed)
+		defer { unlock_memory(mut seed); zeroize(mut seed) }
+
+		mut rng := SecurePRNG{
+			seed: seed
+			counter: 0
+			buffer: []u8{}
+			idx: 0
+		}
+
+		mut random_bytes := []u8{cap: size}
+		for _ in 0 .. size {
+			random_bytes << rng.next_u8()
+		}
+		return random_bytes
+	}
+
+	return secure_random_bytes_fallback(size)
+}
+
+fn secure_random_bytes_fallback(size int) ![]u8 {
 	return crand.bytes(size) or {
 		if os.exists('/dev/urandom') {
 			mut f := os.open('/dev/urandom') or { return error('Failed to open /dev/urandom: ' + err.msg()) }
