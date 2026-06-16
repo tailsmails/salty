@@ -1,3 +1,4 @@
+import time
 import os
 import math.big
 
@@ -111,19 +112,11 @@ fn hex_to_bytes(hex_str string) ![]u8 {
 }
 
 fn openssl_encrypt(plaintext string, password string) !string {
-	// Generate a high-entropy ID for temporary files to prevent predictability
-	mut entropy_p := os.new_process('openssl')
-	entropy_p.set_args(['rand', '-hex', '16'])
-	entropy_p.run()
-	entropy_p.wait()
-	tmp_entropy := entropy_p.stdout_read().trim_space()
-	entropy_p.close()
-	tmp_id := '${os.getpid()}_${tmp_entropy}'
-
-	tmp_plain := os.path_abs(os.join_path(os.temp_dir(), 'salty_p_${tmp_id}.txt'))
-	tmp_comp := os.path_abs(os.join_path(os.temp_dir(), 'salty_c_${tmp_id}.zst'))
-	tmp_enc := os.path_abs(os.join_path(os.temp_dir(), 'salty_e_${tmp_id}.bin'))
-	tmp_key := os.path_abs(os.join_path(os.temp_dir(), 'salty_k_${tmp_id}.txt'))
+	tmp_id := '${os.getpid()}_${time.ticks()}'
+	tmp_plain := os.real_path(os.join_path(os.temp_dir(), 'salty_p_${tmp_id}.txt'))
+	tmp_comp := os.real_path(os.join_path(os.temp_dir(), 'salty_c_${tmp_id}.zst'))
+	tmp_enc := os.real_path(os.join_path(os.temp_dir(), 'salty_e_${tmp_id}.bin'))
+	tmp_key := os.real_path(os.join_path(os.temp_dir(), 'salty_k_${tmp_id}.txt'))
 
 	// Atomic creation with 0600 permissions to prevent race conditions and symlink attacks
 	os.execute('python3 -c "import os, sys; [os.open(f, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600) for f in sys.argv[1:]]" "${tmp_plain}" "${tmp_comp}" "${tmp_enc}" "${tmp_key}"')
@@ -131,48 +124,26 @@ fn openssl_encrypt(plaintext string, password string) !string {
 	os.write_file(tmp_plain, plaintext)!
 	zstd_res := os.execute('zstd -9 -f "${tmp_plain}" -o "${tmp_comp}"')
 	os.rm(tmp_plain) or {}
-	if zstd_res.exit_code != 0 { os.rm(tmp_comp) or {}; return error('ZSTD compression failed') }
+	if zstd_res.exit_code != 0 { os.rm(tmp_comp) or {}; os.rm(tmp_key) or {}; return error('ZSTD compression failed') }
+
+	// Write key to secure file
+	os.write_file(tmp_key, password)!
 
 	// 1. Encryption
-	mut p_enc := os.new_process('openssl')
-	p_enc.set_args(['enc', '-chacha20', '-pbkdf2', '-iter', '100000', '-pass', 'stdin', '-in', tmp_comp, '-out', tmp_enc])
-	p_enc.run()
-	p_enc.stdin_write(password + '\n')
-	p_enc.wait()
-	p_enc.close()
+	enc_res := os.execute('openssl enc -chacha20 -pbkdf2 -iter 100000 -pass "file:${tmp_key}" -in "${tmp_comp}" -out "${tmp_enc}"')
 	os.rm(tmp_comp) or {}
-	if p_enc.exit_code != 0 { os.rm(tmp_enc) or {}; return error('OpenSSL encryption failed') }
+	if enc_res.exit_code != 0 { os.rm(tmp_enc) or {}; os.rm(tmp_key) or {}; return error('OpenSSL encryption failed') }
 
 	// 2. Authenticity (HMAC-SHA256) - Encrypt-then-MAC
-	// Write key to secure file using Python to avoid any shell interpolation/exposure
-	mut p_key := os.new_process('python3')
-	p_key.set_args(['-c', 'import sys; open(sys.argv[1], "wb").write(sys.stdin.read().encode())', tmp_key])
-	p_key.run()
-	p_key.stdin_write(password)
-	p_key.wait()
-	p_key.close()
-
-	mut p_mac := os.new_process('python3')
-	p_mac.set_args(['-c', 'import hmac, hashlib, sys; key=open(sys.argv[1], "rb").read(); data=open(sys.argv[2], "rb").read(); print(hmac.new(key, data, hashlib.sha256).digest().hex())', tmp_key, tmp_enc])
-	p_mac.run()
-	p_mac.wait()
-	mac_hex := p_mac.stdout_read().trim_space()
-	p_mac.close()
-
-	if p_mac.exit_code != 0 {
-		os.rm(tmp_key) or {}
-		os.rm(tmp_enc) or {}
-		return error('MAC generation failed')
-	}
+	mac_res := os.execute('python3 -c "import hmac, hashlib, sys; key=open(sys.argv[1], \'rb\').read(); data=open(sys.argv[2], \'rb\').read(); print(hmac.new(key, data, hashlib.sha256).hexdigest())" "${tmp_key}" "${tmp_enc}"')
+	os.rm(tmp_key) or {}
+	if mac_res.exit_code != 0 { os.rm(tmp_enc) or {}; return error('MAC generation failed') }
+	mac_hex := mac_res.output.trim_space()
 
 	mac_bytes := hex_to_bytes(mac_hex)!
 	enc_bytes := os.read_bytes(tmp_enc)!
-
-	// Secure cleanup
-	os.rm(tmp_key) or {}
 	os.rm(tmp_enc) or {}
 
-	// Result is MAC (32 bytes) + Ciphertext
 	mut combined := mac_bytes.clone()
 	combined << enc_bytes
 	return combined.hex()
@@ -182,7 +153,7 @@ fn compare_macs(a []u8, b []u8) bool {
 	if a.len != b.len { return false }
 	mut res := 0
 	for i in 0 .. a.len {
-		res |= a[i] ^ b[i]
+		res |= int(a[i]) ^ int(b[i])
 	}
 	return res == 0
 }
@@ -194,62 +165,33 @@ fn openssl_decrypt(hex_payload string, password string) !string {
 	received_mac := payload_bytes[0..32]
 	ciphertext := payload_bytes[32..]
 
-	// Generate a high-entropy ID for temporary files to prevent predictability
-	mut entropy_p := os.new_process('openssl')
-	entropy_p.set_args(['rand', '-hex', '16'])
-	entropy_p.run()
-	entropy_p.wait()
-	tmp_entropy := entropy_p.stdout_read().trim_space()
-	entropy_p.close()
-	tmp_id := '${os.getpid()}_${tmp_entropy}'
-
-	tmp_enc := os.path_abs(os.join_path(os.temp_dir(), 'salty_e_${tmp_id}.bin'))
-	tmp_comp := os.path_abs(os.join_path(os.temp_dir(), 'salty_c_${tmp_id}.zst'))
-	tmp_plain := os.path_abs(os.join_path(os.temp_dir(), 'salty_p_${tmp_id}.txt'))
-	tmp_key := os.path_abs(os.join_path(os.temp_dir(), 'salty_k_${tmp_id}.txt'))
+	tmp_id := '${os.getpid()}_${time.ticks()}'
+	tmp_enc := os.real_path(os.join_path(os.temp_dir(), 'salty_e_${tmp_id}.bin'))
+	tmp_comp := os.real_path(os.join_path(os.temp_dir(), 'salty_c_${tmp_id}.zst'))
+	tmp_plain := os.real_path(os.join_path(os.temp_dir(), 'salty_p_${tmp_id}.txt'))
+	tmp_key := os.real_path(os.join_path(os.temp_dir(), 'salty_k_${tmp_id}.txt'))
 
 	// Atomic creation with 0600 permissions
-	os.execute('python3 -c "import os; [os.open(f, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600) for f in [\'${tmp_enc}\', \'${tmp_comp}\', \'${tmp_plain}\', \'${tmp_key}\']]"')
+	os.execute('python3 -c "import os, sys; [os.open(f, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600) for f in sys.argv[1:]]" "${tmp_enc}" "${tmp_comp}" "${tmp_plain}" "${tmp_key}"')
 
 	os.write_bytes(tmp_enc, ciphertext)!
+	os.write_file(tmp_key, password)!
 
 	// 1. Verify MAC first
-	// Write key to secure file via stdin to avoid process list exposure
-	mut p_key := os.new_process('python3')
-	p_key.set_args(['-c', 'import sys; open(sys.argv[1], "wb").write(sys.stdin.read().encode())', tmp_key])
-	p_key.run()
-	p_key.stdin_write(password)
-	p_key.wait()
-	p_key.close()
+	mac_res := os.execute('python3 -c "import hmac, hashlib, sys; key=open(sys.argv[1], \'rb\').read(); data=open(sys.argv[2], \'rb\').read(); print(hmac.new(key, data, hashlib.sha256).hexdigest())" "${tmp_key}" "${tmp_enc}"')
+	if mac_res.exit_code != 0 { os.rm(tmp_enc) or {}; os.rm(tmp_key) or {}; return error('MAC verification script failed') }
 
-	mut p_mac := os.new_process('python3')
-	p_mac.set_args(['-c', 'import hmac, hashlib, sys; key=open(sys.argv[1], "rb").read(); data=open(sys.argv[2], "rb").read(); print(hmac.new(key, data, hashlib.sha256).digest().hex())', tmp_key, tmp_enc])
-	p_mac.run()
-	p_mac.wait()
-	calculated_mac_hex := p_mac.stdout_read().trim_space()
-	p_mac.close()
-	os.rm(tmp_key) or {}
-
-	if p_mac.exit_code != 0 { os.rm(tmp_enc) or {}; return error('MAC verification failed') }
-
-	calculated_mac := hex_to_bytes(calculated_mac_hex)!
-
-	// Constant-time comparison
+	calculated_mac := hex_to_bytes(mac_res.output.trim_space())!
 	if !compare_macs(calculated_mac, received_mac) {
-		os.rm(tmp_enc) or {}
+		os.rm(tmp_enc) or {}; os.rm(tmp_key) or {}
 		return error('Authenticity check failed: Data may have been tampered with or wrong password.')
 	}
 
 	// 2. Decrypt
-	mut p_dec := os.new_process('openssl')
-	p_dec.set_args(['enc', '-chacha20', '-d', '-pbkdf2', '-iter', '100000', '-pass', 'stdin', '-in', tmp_enc, '-out', tmp_comp])
-	p_dec.run()
-	p_dec.stdin_write(password + '\n')
-	p_dec.wait()
-	p_dec.close()
-	os.rm(tmp_enc) or {}
+	dec_res := os.execute('openssl enc -chacha20 -d -pbkdf2 -iter 100000 -pass "file:${tmp_key}" -in "${tmp_enc}" -out "${tmp_comp}"')
+	os.rm(tmp_enc) or {}; os.rm(tmp_key) or {}
 
-	if p_dec.exit_code != 0 { os.rm(tmp_comp) or {}; return error('OpenSSL decryption failed') }
+	if dec_res.exit_code != 0 { os.rm(tmp_comp) or {}; return error('OpenSSL decryption failed') }
 
 	zstd_res := os.execute('zstd -d -f "${tmp_comp}" -o "${tmp_plain}"')
 	os.rm(tmp_comp) or {}
