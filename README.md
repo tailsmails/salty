@@ -36,7 +36,9 @@ Designed for strict forensic security, Salty utilizes UNIX RAM-backed file struc
 
 ### 5. System Pre-flight Validation & Diagnostics
 - **Early Write-Permission Assertions**: To prevent wasting CPU cycles during VDF calculations, Salty proactively verifies write permissions on the target paths before initiating the sequential delay chain.
-- **Android & Cross-Platform Compatibility**: Supports custom-configured base directories for secure RAM virtualization (such as `/data/local/tmp` or `/mnt`), allowing full feature set deployment on rooted Android environments and Termux containers.
+- **Android & Adaptive Termux-API Engine**:
+    - *Privilege-Aware Command Routing*: Supports deployment on **both unrooted and rooted Android/Termux environments**. Salty uses native C-level privilege detection (`C.getuid()`) to safely evaluate the current runtime user. If executed under root (e.g., via `tsu` or inside a root shell), it dynamically drops execution privileges back to the target Termux UID using `su ${uid} -c` for all Termux API commands, ensuring Binder IPC communications can be established without deadlocking.
+    - *Defensive Timeout Protections*: To prevent the utility from freezing indefinitely due to missing or denied Android Runtime permissions (such as Sensors, Location, or Battery), all external Android CLI and Termux API queries are protected by robust `timeout` boundaries.
 - **mlock Capability Checks**: Evaluates system security constraints (e.g., `ulimit -l` or memory-locking restrictions) at startup, warning the user if the kernel restricts RAM pinning.
 
 ---
@@ -75,6 +77,8 @@ sudo ./salty decrypt -f secure.container -o ./restored_project -p "MasterPass" -
 ```bash
 sudo ./salty unmount -f ./mnt/secure_salty
 ```
+
+*(Note: On Android/Termux, you can run commands without `sudo` if you are using it in an unrooted environment).*
 
 ---
 
