@@ -10,6 +10,8 @@ import time
 import x.crypto.chacha20
 import x.crypto.chacha20poly1305
 import compress.zstd
+import crypto.aes
+import crypto.cipher
 
 fn C.memset(ptr voidptr, val int, size usize) voidptr
 fn C.mlock(addr voidptr, len usize) int
@@ -32,7 +34,7 @@ __global (
 
 fn signal_handler(sig int) {
 	unsafe {
-		C.printf(c'\nsalty: signal %d received. cleaning up...\n', sig)
+		C.printf(c'\nsalty: signal %d received. Emergency secure cleanup initiated...\n', sig)
 		
 		mut mp_buf := [256]char{}
 		mut erp_buf := [256]char{}
@@ -53,6 +55,9 @@ fn signal_handler(sig int) {
 		
 		if erp_buf[0] != 0 {
 			mut cmd_buf := [512]char{}
+			C.snprintf(&char(&cmd_buf), 512, c'umount -l %s 2>/dev/null', &char(&erp_buf))
+			C.system(&char(&cmd_buf))
+			
 			C.snprintf(&char(&cmd_buf), 512, c'rm -rf %s 2>/dev/null', &char(&erp_buf))
 			C.system(&char(&cmd_buf))
 		}
@@ -389,7 +394,9 @@ fn secure_shred_file(path string) bool {
 			mut random_data := secure_random_bytes(to_write) or {
 				[]u8{len: to_write, init: 0x00}
 			}
-			f.write(random_data) or {}
+			f.write(random_data) or {
+				break
+			}
 			remaining -= u64(to_write)
 		}
 		f.close()
@@ -537,19 +544,53 @@ fn encrypt_chunk(chunk_data []u8, key []u8, iv []u8, chunk_index u64, use_compre
 	if use_compression {
 		data = zstd.compress(data)!
 	}
+	
+	mut aes_key := key.clone()
+	mut aes_iv := iv.clone()
+	
+	block := aes.new_cipher(aes_key)
+	mut ctr := cipher.new_ctr(block, aes_iv)
+	
+	mut aes_encrypted := []u8{len: data.len}
+	ctr.xor_key_stream(mut aes_encrypted, data)
+	
 	mut chunk_nonce := []u8{len: 12, init: 0}
 	for i in 0 .. 4 { chunk_nonce[i] = iv[i] }
 	write_u64_to_buf(mut chunk_nonce, chunk_index, 4)
-	return chacha20poly1305.encrypt(data, key, chunk_nonce, []u8{})!
+	
+	mut chacha_key_input := []u8{cap: key.len + 6}
+	for b in key { chacha_key_input << b }
+	for b in "chacha".bytes() { chacha_key_input << b }
+	chacha_key_hash := sha3.sum512(chacha_key_input)
+	chacha_key := chacha_key_hash[0..32].clone()
+	
+	return chacha20poly1305.encrypt(aes_encrypted, chacha_key, chunk_nonce, []u8{})!
 }
 
 fn decrypt_chunk(cipher_bytes []u8, key []u8, iv []u8, chunk_index u64, use_compression bool) ![]u8 {
 	mut chunk_nonce := []u8{len: 12, init: 0}
 	for i in 0 .. 4 { chunk_nonce[i] = iv[i] }
 	write_u64_to_buf(mut chunk_nonce, chunk_index, 4)
-	mut decrypted := chacha20poly1305.decrypt(cipher_bytes, key, chunk_nonce, []u8{}) or {
-		return error('salty: chunk payload decryption failed')
+	
+	mut chacha_key_input := []u8{cap: key.len + 6}
+	for b in key { chacha_key_input << b }
+	for b in "chacha".bytes() { chacha_key_input << b }
+	chacha_key_hash := sha3.sum512(chacha_key_input)
+	chacha_key := chacha_key_hash[0..32].clone()
+	
+	mut aes_encrypted := chacha20poly1305.decrypt(cipher_bytes, chacha_key, chunk_nonce, []u8{}) or {
+		return error('salty: chunk payload decryption failed (chacha layer)')
 	}
+	
+	mut aes_key := key.clone()
+	mut aes_iv := iv.clone()
+	
+	block := aes.new_cipher(aes_key)
+	mut ctr := cipher.new_ctr(block, aes_iv)
+	
+	mut decrypted := []u8{len: aes_encrypted.len}
+	ctr.xor_key_stream(mut decrypted, aes_encrypted)
+	
 	if use_compression {
 		decrypted = zstd.decompress(decrypted)!
 	}
@@ -566,18 +607,18 @@ mut:
 
 fn encrypt_vfs_file(plain []u8, key []u8) ![]u8 {
 	nonce := secure_random_bytes(12)!
-	cipher := chacha20poly1305.encrypt(plain, key, nonce, []u8{})!
-	mut out := []u8{cap: 12 + cipher.len}
+	cipher_bytes := chacha20poly1305.encrypt(plain, key, nonce, []u8{})!
+	mut out := []u8{cap: 12 + cipher_bytes.len}
 	for b in nonce { out << b }
-	for b in cipher { out << b }
+	for b in cipher_bytes { out << b }
 	return out
 }
 
 fn decrypt_vfs_file(enc []u8, key []u8) ![]u8 {
 	if enc.len < 12 { return error('salty: memory structure payload error') }
 	nonce := enc[0..12]
-	cipher := enc[12..]
-	return chacha20poly1305.decrypt(cipher, key, nonce, []u8{}) or {
+	cipher_bytes := enc[12..]
+	return chacha20poly1305.decrypt(cipher_bytes, key, nonce, []u8{}) or {
 		return error('salty: memory structure decryption failed')
 	}
 }
@@ -672,7 +713,9 @@ fn get_all_files_recursive(dir_path string) ![]string {
 fn pack_source_to_vfs(source_path string, temp_key []u8) ![]MemFile {
 	mut files := []MemFile{}
 	if os.is_dir(source_path) {
-		all_paths := get_all_files_recursive(source_path)!
+		all_paths := get_all_files_recursive(source_path) or {
+			return error('salty: failed to scan source directory "${source_path}": ${err.msg()}')
+		}
 		clean_folder := source_path.replace('\\', '/').trim_right('/')
 		for path in all_paths {
 			clean_path := path.replace('\\', '/')
@@ -681,7 +724,9 @@ fn pack_source_to_vfs(source_path string, temp_key []u8) ![]MemFile {
 				relative_path = clean_path[clean_folder.len + 1 .. ]
 			}
 			
-			mut content := os.read_bytes(path)!
+			mut content := os.read_bytes(path) or {
+				return error('salty: failed to read file "${path}": ${err.msg()}')
+			}
 			lock_memory(mut content)
 			defer { unlock_memory(mut content); zeroize(mut content) }
 			
@@ -695,7 +740,9 @@ fn pack_source_to_vfs(source_path string, temp_key []u8) ![]MemFile {
 		}
 	} else if os.exists(source_path) {
 		filename := os.file_name(source_path)
-		mut content := os.read_bytes(source_path)!
+		mut content := os.read_bytes(source_path) or {
+			return error('salty: failed to read file "${source_path}": ${err.msg()}')
+		}
 		lock_memory(mut content)
 		defer { unlock_memory(mut content); zeroize(mut content) }
 		
@@ -760,7 +807,7 @@ fn shred_and_remove_dir_recursive(dir_path string) ! {
 		if has_failures {
 			return error('salty: some files are locked and could not be removed')
 		}
-		return error('salty: directory removal failed "${dir_path}": ${err}')
+		return error('salty: directory removal failed "${dir_path}": ${err.msg()}')
 	}
 	if has_failures {
 		return error('salty: shred failed on some files')
@@ -788,6 +835,20 @@ fn verify_write_permission(file_path string) ! {
 		f.close()
 		os.rm(file_path) or {}
 	}
+}
+
+fn verify_written_container(path string, expected_min_size u64) ! {
+	if !os.exists(path) {
+		return error('salty: verification failed: container file does not exist')
+	}
+	size := os.file_size(path)
+	if u64(size) < expected_min_size {
+		return error('salty: verification failed: container size is too small (${size} bytes, expected at least ${expected_min_size} bytes)')
+	}
+	mut f := os.open(path) or {
+		return error('salty: verification failed: cannot open container: ${err.msg()}')
+	}
+	f.close()
 }
 
 fn run_cmd(cmd string) bool {
@@ -827,20 +888,27 @@ fn execute_unmount(mount_point string, safe_erp string) ! {
 			println(term.gray('salty: standard umount failed. trying lazy umount...'))
 			if !run_cmd('umount -l ${safe_mount_point}') {
 				println(term.red('salty: error: could not unmount "${mount_point}"'))
+				return error('salty: mount point is busy. close all files accessing it.')
 			}
 		}
 		run_cmd('nsenter -t 1 -m umount -l ${safe_mount_point}')
 	}
 	
 	if safe_erp != '' && os.exists(safe_erp) {
-		println(term.gray('salty: shredding in-memory RAM files...'))
-		shred_and_remove_dir_recursive(safe_erp) or {
-			println(term.red('salty: error during RAM shredding: ${err}'))
+		if is_mounted(safe_erp) {
+			println(term.gray('salty: unmounting dedicated RAM disk...'))
+			safe_erp_path := sanitize_path(safe_erp)
+			if !run_cmd('umount ${safe_erp_path}') {
+				run_cmd('umount -l ${safe_erp_path}')
+			}
 		}
 	}
 	
 	if os.exists(mount_point) {
 		os.rmdir(mount_point) or {}
+	}
+	if safe_erp != '' && os.exists(safe_erp) {
+		os.rmdir(safe_erp) or {}
 	}
 }
 
@@ -848,12 +916,16 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string,
 seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 { 
 	if !os.exists(file_path) { return error('salty: container path not found') } 
 
-	mut infile := os.open(file_path)!
+	mut infile := os.open(file_path) or {
+		return error('salty: failed to open container: ${err.msg()}')
+	}
 	defer { infile.close() }
 
 	println(term.gray('salty: reading container...'))
 	mut file_salt := []u8{len: 32}
-	n_salt := infile.read(mut file_salt)!
+	n_salt := infile.read(mut file_salt) or {
+		return error('salty: failed to read salt: ${err.msg()}')
+	}
 	if n_salt < 32 { return error('salty: invalid file size') }
 
 	mut mask_input := []u8{cap: password.len + file_salt.len}
@@ -878,7 +950,9 @@ seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 {
 	println(term.gray('salty: sequential delay chain completed in ${time.since(start_time).seconds():.2f}s.'))
 	
 	mut masked_mixed_size := []u8{len: 4}
-	n_size := infile.read(mut masked_mixed_size)!
+	n_size := infile.read(mut masked_mixed_size) or {
+		return error('salty: failed to read metadata size block: ${err.msg()}')
+	}
 	if n_size < 4 { return error('salty: invalid file structure') }
 
 	mut mixed_size_buf := []u8{len: 4}
@@ -892,7 +966,9 @@ seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 {
 	}
 
 	mut mixed := []u8{len: int(mixed_len)}
-	n_mixed := infile.read(mut mixed)!
+	n_mixed := infile.read(mut mixed) or {
+		return error('salty: failed to read container layout block: ${err.msg()}')
+	}
 	if n_mixed < int(mixed_len) { return error('salty: truncated file structure') }
 
 	total_len := mixed.len
@@ -1028,7 +1104,9 @@ seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 {
 		}
 		
 		mut enc_chunk := []u8{len: int(enc_len)}
-		n_chunk := infile.read(mut enc_chunk)!
+		n_chunk := infile.read(mut enc_chunk) or {
+			return error('salty: failed to read payload chunk: ${err.msg()}')
+		}
 		if n_chunk < int(enc_len) { return error('salty: corrupted binary payloads') }
 		
 		dec_chunk := decrypt_chunk(enc_chunk, session_key, session_iv, chunk_index, header.use_compression)!
@@ -1043,8 +1121,20 @@ seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 {
 fn locktime_encrypt_mem(vfs_payload []u8, out_path string, duration_sec u64,
 password string, seed0_str string, seed1_str string, seed2_str string, mem u32, iter u32, threads
 u8, pbkdf2_iter int, use_compression bool) ! { 
-	mut outfile := os.create(out_path)!
-	defer { outfile.close() }
+	temp_rand := secure_random_bytes(4) or { []u8{len: 4, init: 0xaa} }
+	temp_path := out_path + '.tmp.' + temp_rand.hex()
+	
+	mut outfile := os.create(temp_path) or {
+		return error('salty: failed to create temporary container file: ${err.msg()}')
+	}
+	
+	mut success := false
+	defer {
+		outfile.close()
+		if !success {
+			os.rm(temp_path) or {}
+		}
+	}
 
 	file_salt := secure_random_bytes(32)!
 	outfile.write(file_salt)!
@@ -1212,7 +1302,30 @@ u8, pbkdf2_iter int, use_compression bool) ! {
 		chunk_index++
 	}
 
+	outfile.flush()
 	outfile.close()
+
+	verify_written_container(temp_path, 262180) or {
+		return error('salty: temporary file verification failed: ${err.msg()}')
+	}
+
+	if os.exists(out_path) {
+		backup_path := out_path + '.bak'
+		os.cp(out_path, backup_path) or {
+			return error('salty: failed to create container backup: ${err.msg()}')
+		}
+		os.mv(temp_path, out_path) or {
+			os.mv(backup_path, out_path) or {}
+			return error('salty: failed to overwrite original container safely: ${err.msg()}')
+		}
+		os.rm(backup_path) or {}
+	} else {
+		os.mv(temp_path, out_path) or {
+			return error('salty: failed to write container to destination: ${err.msg()}')
+		}
+	}
+
+	success = true
 }
 
 fn run_mount_flow(container_path string, duration u64, password string,
@@ -1237,11 +1350,16 @@ fn run_mount_flow(container_path string, duration u64, password string,
 		}
 	}
 	check_dir_write_permission(mnt_parent)!
-
+	
 	mut erp_rand := secure_random_bytes(8)!
-	safe_erp := os.join_path('/dev/shm', 'salty_erp_' + erp_rand.hex())
+	safe_erp := os.join_path('/mnt', 'salty_erp_' + erp_rand.hex())
 	os.mkdir_all(safe_erp) or {
 		return error('salty: secure memory directory creation failed: ${err}')
+	}
+	
+	if !run_cmd('mount -t tmpfs -o size=256M,mode=0700 tmpfs ${sanitize_path(safe_erp)}') {
+		os.rmdir(safe_erp) or {}
+		return error('salty: dedicated tmpfs mount failed. Administrative privileges (root/sudo) are required.')
 	}
 
 	container_base := os.file_name(container_path)
@@ -1302,15 +1420,43 @@ fn run_mount_flow(container_path string, duration u64, password string,
 	}
 
 	println('salty: container is mounted at: ${mount_dir}')
-	os.input('Press ENTER to unmount, shred temp files, and save changes... ')
+	
+	mut updated_files := []MemFile{}
+	for {
+		action_input := os.input('Press ENTER to unmount, shred temp files, and save changes (or type "abort" to discard all changes): ').trim_space()
+		
+		if action_input.to_lower() == 'abort' {
+			confirm := os.input('Are you absolutely sure you want to discard ALL changes made in this mount? (y/N): ').trim_space().to_lower()
+			if confirm == 'y' {
+				println(term.yellow('salty: discarding changes and unmounting...'))
+				break
+			}
+			continue
+		}
 
-	println(term.gray('salty: reading changes...'))
-	mut updated_files := pack_source_to_vfs(mount_dir, temp_key)!
+		println(term.gray('salty: reading changes...'))
+		updated_files = pack_source_to_vfs(mount_dir, temp_key) or {
+			println(term.red('salty: save failed: could not read updated files from mount point: ${err.msg()}'))
+			println(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue and try again.'))
+			continue
+		}
 
-	println(term.gray('salty: encrypting...'))
-	serialized := serialize_vfs(mut updated_files, temp_key)!
-	locktime_encrypt_mem(serialized, container_path, duration, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, use_compression)!
-	println(term.gray('salty: container updated successfully.'))
+		println(term.gray('salty: encrypting...'))
+		serialized := serialize_vfs(mut updated_files, temp_key) or {
+			println(term.red('salty: save failed: could not serialize files: ${err.msg()}'))
+			println(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue and try again.'))
+			continue
+		}
+		
+		locktime_encrypt_mem(serialized, container_path, duration, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, use_compression) or {
+			println(term.red('salty: save failed: could not encrypt and update container: ${err.msg()}'))
+			println(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue (e.g. check permissions/disk space) and try again.'))
+			continue
+		}
+		
+		println(term.gray('salty: container updated successfully.'))
+		break
+	}
 
 	execute_unmount(mount_dir, safe_erp)!
 	clean_exit = true
@@ -1345,6 +1491,10 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 	mut files := pack_source_to_vfs(file_path, temp_key)!
 	serialized := serialize_vfs(mut files, temp_key)!
 	locktime_encrypt_mem(serialized, out_path, duration_sec, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, use_compression)!
+
+	verify_written_container(out_path, 262180) or {
+		return error('salty: safety check failed. Encrypted container not verified. Original files left untouched. Details: ${err.msg()}')
+	}
 
 	if shred_orig {
 		if os.is_dir(file_path) {
@@ -1955,7 +2105,7 @@ fn run_salty_interactive() ! {
 	if method == '4' {
 		file_path := os.input('Enter container file path (e.g. secure.container): ').trim_space()
 		mut is_new := false
-		_ := is_new // false unused variable warning/error bruh
+		_ := is_new 
 		if !os.exists(file_path) {
 			ans := os.input('Container file does not exist. Create a new empty container? (y/n): ').trim_space().to_lower()
 			if ans == 'y' { is_new = true } else { return }
