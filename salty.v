@@ -546,10 +546,14 @@ fn encrypt_chunk(chunk_data []u8, key []u8, iv []u8, chunk_index u64, use_compre
 	}
 	
 	mut aes_key := key.clone()
-	mut aes_iv := iv.clone()
+	mut chunk_aes_iv := iv.clone()
+	if chunk_aes_iv.len < 16 {
+		return error('salty: invalid AES IV length')
+	}
+	write_u64_to_buf(mut chunk_aes_iv, chunk_index, 8)
 	
 	block := aes.new_cipher(aes_key)
-	mut ctr := cipher.new_ctr(block, aes_iv)
+	mut ctr := cipher.new_ctr(block, chunk_aes_iv)
 	
 	mut aes_encrypted := []u8{len: data.len}
 	ctr.xor_key_stream(mut aes_encrypted, data)
@@ -583,10 +587,15 @@ fn decrypt_chunk(cipher_bytes []u8, key []u8, iv []u8, chunk_index u64, use_comp
 	}
 	
 	mut aes_key := key.clone()
-	mut aes_iv := iv.clone()
+	
+	mut chunk_aes_iv := iv.clone()
+	if chunk_aes_iv.len < 16 {
+		return error('salty: invalid AES IV length')
+	}
+	write_u64_to_buf(mut chunk_aes_iv, chunk_index, 8)
 	
 	block := aes.new_cipher(aes_key)
-	mut ctr := cipher.new_ctr(block, aes_iv)
+	mut ctr := cipher.new_ctr(block, chunk_aes_iv)
 	
 	mut decrypted := []u8{len: aes_encrypted.len}
 	ctr.xor_key_stream(mut decrypted, aes_encrypted)
