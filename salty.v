@@ -927,30 +927,56 @@ fn pack_source_to_vfs(source_path string, temp_key []u8) ![]MemFile {
 }
 
 fn unpack_vfs_to_folder(files []MemFile, output_folder string, temp_key []u8) ! {
-	os.mkdir_all(output_folder) or {}
-	for f in files {
-		mut plain := []u8{}
-		if f.is_loaded {
-			plain = f.plain_data.clone()
-		} else {
-			plain = decrypt_vfs_file(f.enc_data, temp_key)!
-		}
-		
-		dest_path := get_safe_destination_path(output_folder, f.name) or {
-    		return error(err.msg())
-		}
-		parent_dir := os.dir(dest_path)
-		os.mkdir_all(parent_dir) or {}
-		
-		if os.exists(dest_path) {
-			os.chmod(dest_path, 0o600) or {}
-		}
-		
-		os.write_bytes(dest_path, plain) or {
-			return error('salty: write failed "${dest_path}": ${err}')
-		}
-		zeroize(mut plain)
-	}
+    os.mkdir_all(output_folder) or {}
+    
+    real_base := os.real_path(output_folder)
+    
+    for f in files {
+        mut plain := []u8{}
+        if f.is_loaded {
+            plain = f.plain_data.clone()
+        } else {
+            plain = decrypt_vfs_file(f.enc_data, temp_key)!
+        }
+        
+        dest_path := get_safe_destination_path(real_base, f.name) or {
+            return error(err.msg())
+        }
+        parent_dir := os.dir(dest_path)
+        os.mkdir_all(parent_dir) or {}
+        
+        real_parent := os.real_path(parent_dir)
+        
+        mut is_inside := false
+        if real_parent == real_base {
+            is_inside = true
+        } else {
+            sep := os.path_separator
+            mut base_with_sep := real_base
+            if !base_with_sep.ends_with(sep) {
+                base_with_sep += sep
+            }
+            if real_parent.starts_with(base_with_sep) {
+                is_inside = true
+            }
+        }
+        
+        if !is_inside {
+            return error('salty: physical path traversal detected via symlink resolution for: ${f.name}')
+        }
+        
+        if os.exists(dest_path) {
+            if os.is_link(dest_path) {
+                return error('salty: destination target is an existing symbolic link: ${dest_path}')
+            }
+            os.chmod(dest_path, 0o600) or {}
+        }
+        
+        os.write_bytes(dest_path, plain) or {
+            return error('salty: write failed "${dest_path}": ${err}')
+        }
+        zeroize(mut plain)
+    }
 }
 
 fn shred_and_remove_dir_recursive(dir_path string) ! {
@@ -2620,11 +2646,12 @@ fn main() {
 }
 
 fn get_safe_destination_path(base_dir string, rel_path string) !string {
-    normalized := rel_path.replace('\\', '/')
-    if normalized.contains('../') || normalized.contains('/..') || normalized == '..' {
-        return error('salty: path traversal attempt detected in filename: ${rel_path}')
-    }
+    mut normalized := rel_path.replace('\\', '/')
     
+    if normalized.starts_with('/') || normalized.contains(':/') || normalized.starts_with('//') {
+        return error('salty: absolute path, UNC or drive letter detected in filename: ${rel_path}')
+    }
+
     parts := normalized.split('/')
     mut clean_parts := []string{}
     for part in parts {
@@ -2633,8 +2660,16 @@ fn get_safe_destination_path(base_dir string, rel_path string) !string {
             continue
         }
         if trimmed == '..' {
-            return error('salty: path traversal attempt detected')
+            return error('salty: path traversal attempt detected: ${rel_path}')
         }
+        
+        upper_part := trimmed.to_upper()
+        if upper_part in ['CON', 'PRN', 'AUX', 'NUL'] || 
+           (upper_part.starts_with('COM') && upper_part.len == 4 && upper_part[3] >= `1` && upper_part[3] <= `9`) ||
+           (upper_part.starts_with('LPT') && upper_part.len == 4 && upper_part[3] >= `1` && upper_part[3] <= `9`) {
+            return error('salty: reserved system filename detected: ${trimmed}')
+        }
+        
         clean_parts << trimmed
     }
     
@@ -2642,7 +2677,7 @@ fn get_safe_destination_path(base_dir string, rel_path string) !string {
         return error('salty: empty filename inside container')
     }
     
-    clean_rel := clean_parts.join('/')
+    clean_rel := clean_parts.join(os.path_separator)
     full_path := os.join_path(base_dir, clean_rel)
     
     return full_path
