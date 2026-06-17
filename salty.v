@@ -152,8 +152,12 @@ fn signal_handler(sig int) {
 		mut mp_buf := [256]char{}
 		mut erp_buf := [256]char{}
 		
-		C.snprintf(&char(&mp_buf), 256, c'%s', g_active_mount_point.str)
-		C.snprintf(&char(&erp_buf), 256, c'%s', g_active_safe_erp.str)
+		if g_active_mount_point.len > 0 && g_active_mount_point.len < 250 {
+			C.snprintf(&char(&mp_buf), 256, c'%s', g_active_mount_point.str)
+		}
+		if g_active_safe_erp.len > 0 && g_active_safe_erp.len < 250 {
+			C.snprintf(&char(&erp_buf), 256, c'%s', g_active_safe_erp.str)
+		}
 		
 		if mp_buf[0] != 0 {
 			mut cmd_buf := [512]char{}
@@ -651,7 +655,7 @@ fn deserialize_header(b []u8, key_seed0 []u8, file_salt []u8) !DecryptedHeader {
     offset := 192
     key_len := read_u32(b, offset)
     
-    if u64(b.len) < u64(offset + 4 + int(key_len)) {
+    if b.len - offset - 4 < int(key_len) || int(key_len) < 0 {
         return error('salty: malformed header payload length')
     }
     
@@ -761,7 +765,7 @@ mut:
 }
 
 fn encrypt_vfs_file(plain []u8, key []u8) ![]u8 {
-	nonce := secure_random_bytes(12)!
+	mut nonce := secure_random_bytes(12)!
 	cipher_bytes := chacha20poly1305.encrypt(plain, key, nonce, []u8{})!
 	mut out := []u8{cap: 12 + cipher_bytes.len}
 	for b in nonce { out << b }
@@ -812,7 +816,9 @@ fn deserialize_vfs(data []u8, temp_key []u8) ![]MemFile {
     mut offset := 4
     mut files := []MemFile{}
     for _ in 0 .. num_files {
-        if offset + 4 > data.len { return error('salty: structure unpacking failure (name len)') }
+        if data.len - offset < 4 { 
+            return error('salty: structure unpacking failure (name len)') 
+        }
         name_len := int(read_u32(data, offset))
         offset += 4
         
@@ -820,11 +826,15 @@ fn deserialize_vfs(data []u8, temp_key []u8) ![]MemFile {
             return error('salty: invalid filename length')
         }
         
-        if offset + name_len > data.len { return error('salty: structure unpacking failure (name)') }
+        if data.len - offset < name_len { 
+            return error('salty: structure unpacking failure (name)') 
+        }
         name := data[offset .. offset + name_len].bytestr()
         offset += name_len
         
-        if offset + 4 > data.len { return error('salty: structure unpacking failure (data len)') }
+        if data.len - offset < 4 { 
+            return error('salty: structure unpacking failure (data len)') 
+        }
         data_len := int(read_u32(data, offset))
         offset += 4
         
@@ -832,7 +842,9 @@ fn deserialize_vfs(data []u8, temp_key []u8) ![]MemFile {
             return error('salty: file payload exceeds safe limits')
         }
         
-        if offset + data_len > data.len { return error('salty: structure unpacking failure (data)') }
+        if data.len - offset < data_len { 
+            return error('salty: structure unpacking failure (data)') 
+        }
         plain := data[offset .. offset + data_len].clone()
         offset += data_len
         
@@ -1522,6 +1534,18 @@ fn run_mount_flow(container_path string, duration u64, password string,
 	if clean_name == '' {
 		clean_name = container_base
 	}
+	
+	mut sanitized_runes := []rune{}
+	for r in clean_name.runes() {
+		if (r >= `a` && r <= `z`) || (r >= `A` && r <= `Z`) || (r >= `0` && r <= `9`) || r == `_` || r == `-` {
+			sanitized_runes << r
+		}
+	}
+	clean_name = sanitized_runes.string()
+	if clean_name == '' {
+		clean_name = 'container'
+	}
+
 	mount_dir := os.join_path(mnt_parent, '${clean_name}_salty')
 
 	if os.exists(mount_dir) {
@@ -2596,23 +2620,30 @@ fn main() {
 }
 
 fn get_safe_destination_path(base_dir string, rel_path string) !string {
-    if rel_path.contains('..') || rel_path.starts_with('/') || rel_path.starts_with('\\') {
+    normalized := rel_path.replace('\\', '/')
+    if normalized.contains('../') || normalized.contains('/..') || normalized == '..' {
         return error('salty: path traversal attempt detected in filename: ${rel_path}')
     }
     
-    clean_rel := rel_path.replace('\\', '/').trim_left('/')
-    if clean_rel == '' {
+    parts := normalized.split('/')
+    mut clean_parts := []string{}
+    for part in parts {
+        trimmed := part.trim_space()
+        if trimmed == '' || trimmed == '.' {
+            continue
+        }
+        if trimmed == '..' {
+            return error('salty: path traversal attempt detected')
+        }
+        clean_parts << trimmed
+    }
+    
+    if clean_parts.len == 0 {
         return error('salty: empty filename inside container')
     }
     
+    clean_rel := clean_parts.join('/')
     full_path := os.join_path(base_dir, clean_rel)
-    
-    abs_base := os.real_path(base_dir)
-    abs_dest := os.real_path(os.dir(full_path))
-    
-    if !abs_dest.starts_with(abs_base) {
-        return error('salty: path traversal validation failed')
-    }
     
     return full_path
 }
