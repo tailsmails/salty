@@ -1105,8 +1105,7 @@ fn execute_unmount(mount_point string, safe_erp string) ! {
 	}
 }
 
-fn locktime_decrypt_mem(file_path string, duration_sec u64, password string,
-seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 { 
+fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, pbkdf2_iter int) ![]u8 { 
 	if !os.exists(file_path) { return error('salty: container path not found') } 
 
 	mut infile := os.open(file_path) or {
@@ -1142,6 +1141,10 @@ seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 {
 	defer { unlock_memory(mut x_bytes); zeroize(mut x_bytes) }
 	println(term.gray('salty: sequential delay chain completed in ${time.since(start_time).seconds():.2f}s.'))
 	
+	seed0_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed0_salt'.bytes(), 5000, 32).hex()
+	seed1_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed1_salt'.bytes(), 5000, 32).hex()
+	seed2_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed2_salt'.bytes(), 5000, 32).hex()
+	
 	mut masked_mixed_size := []u8{len: 4}
 	n_size := infile.read(mut masked_mixed_size) or {
 		return error('salty: failed to read metadata size block: ${err.msg()}')
@@ -1165,7 +1168,7 @@ seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 {
 	if n_mixed < int(mixed_len) { return error('salty: truncated file structure') }
 
 	total_len := mixed.len
-	mut seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
+	mut seed_bytes1 := derive_seed1(seed1_derived, file_salt, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes1); zeroize(mut seed_bytes1) }
 
 	mut all_indices := []int{len: total_len}
@@ -1210,7 +1213,7 @@ seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 {
 	for b in file_salt { key_seed0_salt << b }
 	for b in "seed0key".bytes() { key_seed0_salt << b }
 	
-	mut key_seed0 := argon2.d_key(seed0_str.bytes(), key_seed0_salt, 3, 32768, 2, 32)!
+	mut key_seed0 := argon2.d_key(seed0_derived.bytes(), key_seed0_salt, 3, 32768, 2, 32)!
 	lock_memory(mut key_seed0)
 	defer { unlock_memory(mut key_seed0); zeroize(mut key_seed0) }
 	
@@ -1249,7 +1252,7 @@ seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 {
 	lock_memory(mut session_iv)
 	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
 
-	mut seed_bytes2 := derive_seed2(seed2_str, x_bytes, pbkdf2_iter)!
+	mut seed_bytes2 := derive_seed2(seed2_derived, x_bytes, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
 
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
@@ -1312,8 +1315,7 @@ seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int) ![]u8 {
 }
 
 fn locktime_encrypt_mem(vfs_payload []u8, out_path string, duration_sec u64,
-password string, seed0_str string, seed1_str string, seed2_str string, mem u32, iter u32, threads
-u8, pbkdf2_iter int, use_compression bool) ! { 
+password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression bool) ! { 
 	temp_rand := secure_random_bytes(4) or { []u8{len: 4, init: 0xaa} }
 	temp_path := out_path + '.tmp.' + temp_rand.hex()
 	
@@ -1328,6 +1330,10 @@ u8, pbkdf2_iter int, use_compression bool) ! {
 			os.rm(temp_path) or {}
 		}
 	}
+	
+	seed0_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed0_salt'.bytes(), 5000, 32).hex()
+	seed1_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed1_salt'.bytes(), 5000, 32).hex()
+	seed2_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed2_salt'.bytes(), 5000, 32).hex()
 
 	file_salt := secure_random_bytes(32)!
 	outfile.write(file_salt)!
@@ -1365,10 +1371,10 @@ u8, pbkdf2_iter int, use_compression bool) ! {
 	lock_memory(mut session_iv)
 	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
 
-	mut seed_bytes1 := derive_seed1(seed1_str, file_salt, pbkdf2_iter)!
+	mut seed_bytes1 := derive_seed1(seed1_derived, file_salt, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes1); zeroize(mut seed_bytes1) }
 
-	mut seed_bytes2 := derive_seed2(seed2_str, w_trapdoor_bytes, pbkdf2_iter)!
+	mut seed_bytes2 := derive_seed2(seed2_derived, w_trapdoor_bytes, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
 
 	chunk_size := 1024 * 1024
@@ -1404,7 +1410,7 @@ u8, pbkdf2_iter int, use_compression bool) ! {
 	for b in file_salt { key_seed0_salt << b }
 	for b in "seed0key".bytes() { key_seed0_salt << b }
 	
-	mut key_seed0 := argon2.d_key(seed0_str.bytes(), key_seed0_salt, 3, 32768, 2, 32)!
+	mut key_seed0 := argon2.d_key(seed0_derived.bytes(), key_seed0_salt, 3, 32768, 2, 32)!
 	lock_memory(mut key_seed0)
 	defer { unlock_memory(mut key_seed0); zeroize(mut key_seed0) }
 	
@@ -1522,8 +1528,7 @@ u8, pbkdf2_iter int, use_compression bool) ! {
 }
 
 fn run_mount_flow(container_path string, duration u64, password string,
-	seed0_str string, seed1_str string, seed2_str string, mem u32, iter u32, threads u8, 
-	pbkdf2_iter int, use_compression bool) ! {
+	mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression bool) ! {
 
 	if !os.exists(container_path) {
 		return error('salty: file path not found: ${container_path}')
@@ -1597,7 +1602,7 @@ fn run_mount_flow(container_path string, duration u64, password string,
 	defer { unlock_memory(mut temp_key); zeroize(mut temp_key) }
 
 	println(term.gray('salty: decrypting container...'))
-	decrypted_data := locktime_decrypt_mem(container_path, duration, password, seed0_str, seed1_str, seed2_str, pbkdf2_iter)!
+	decrypted_data := locktime_decrypt_mem(container_path, duration, password, pbkdf2_iter)!
 	mut files := deserialize_vfs(decrypted_data, temp_key)!
 	println(term.gray('salty: decryption finished. unpacking...'))
 
@@ -1653,7 +1658,7 @@ fn run_mount_flow(container_path string, duration u64, password string,
 			continue
 		}
 		
-		locktime_encrypt_mem(serialized, container_path, duration, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, use_compression) or {
+		locktime_encrypt_mem(serialized, container_path, duration, password, mem, iter, threads, pbkdf2_iter, use_compression) or {
 			println(term.red('salty: save failed: could not encrypt and update container: ${err.msg()}'))
 			println(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue (e.g. check permissions/disk space) and try again.'))
 			continue
@@ -1685,8 +1690,7 @@ fn run_mount_flow(container_path string, duration u64, password string,
 }
 
 fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64,
-password string, seed0_str string, seed1_str string, seed2_str string, mem u32, iter u32, threads
-u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! { 
+password string, mem u32, iter u32, threads u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! { 
 	verify_write_permission(out_path)!
 
 	mut temp_key := secure_random_bytes(32)!
@@ -1695,7 +1699,7 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 
 	mut files := pack_source_to_vfs(file_path, temp_key)!
 	serialized := serialize_vfs(mut files, temp_key)!
-	locktime_encrypt_mem(serialized, out_path, duration_sec, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, use_compression)!
+	locktime_encrypt_mem(serialized, out_path, duration_sec, password, mem, iter, threads, pbkdf2_iter, use_compression)!
 
 	verify_written_container(out_path, 262180) or {
 		return error('salty: safety check failed. Encrypted container not verified. Original files left untouched. Details: ${err.msg()}')
@@ -1713,13 +1717,13 @@ u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! {
 }
 
 fn locktime_decrypt_flow(file_path string, out_path string, duration_sec u64, password string,
-seed0_str string, seed1_str string, seed2_str string, pbkdf2_iter int, shred_orig bool) ! { 
+pbkdf2_iter int, shred_orig bool) ! { 
 	if !os.exists(file_path) { return error('salty: input container not found') }
 	
 	os.mkdir_all(out_path) or {}
 	check_dir_write_permission(out_path)!
 
-	decrypted_data := locktime_decrypt_mem(file_path, duration_sec, password, seed0_str, seed1_str, seed2_str, pbkdf2_iter)!
+	decrypted_data := locktime_decrypt_mem(file_path, duration_sec, password, pbkdf2_iter)!
 
 	mut temp_key := secure_random_bytes(32)!
 	lock_memory(mut temp_key)
@@ -1994,10 +1998,7 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed s
 		modified_text << ch
 		i++
 	}
-	if p > zero {
-		return error('salty: cover text is too short or intensity is too low')
-	}
-	println(term.gray('salty: carrier text generated successfully:'))
+	println('\nsalty: carrier text generated:')
 	println(modified_text.string())
 }
 
@@ -2316,14 +2317,11 @@ fn run_salty_interactive() ! {
 			if ans == 'y' { is_new = true } else { return }
 		}
 		password := os.input_password('Enter Master Password: ')!
-		seed0_str := os.input_password('Enter Seed 0 (Header Key): ')!
-		seed1_str := os.input_password('Enter Seed 1 (VDF Key): ')!
-		seed2_str := os.input_password('Enter Seed 2 (Payload Key): ')!
 		duration_str := os.input('Enter Time Lock iterations (default 100000): ').trim_space()
 		duration := if duration_str == '' { u64(100000) } else { duration_str.u64() }
 		compress_ans := os.input('Use compression? (y/n): ').trim_space().to_lower()
 		use_compression := compress_ans == 'y'
-		run_mount_flow(file_path, duration, password, seed0_str, seed1_str, seed2_str, 65536, 3, 4, 200000, use_compression)!
+		run_mount_flow(file_path, duration, password, 65536, 3, 4, 200000, use_compression)!
 		return
 	}
 	if method == '1' || method == '2' {
@@ -2408,9 +2406,6 @@ fn print_help() {
 	println('  -o, --out <path>           Output container file or decrypted folder path')
 	println('  -t, --time <iterations>    VDF sequential delay chain iteration count (Default: 100000)')
 	println('  -p, --pass <password>      Master password for cryptographic protection')
-	println('  -s0, --seed0 <str>         Independent seed for VDF metadata mapping')
-	println('  -s1, --seed1 <str>         Independent seed for VDF block layout')
-	println('  -s2, --seed2 <str>         Independent seed for payload permutation')
 	println('  -sh, --shred               Securely shred the original source after execution')
 	println('  -c, --compress             Enable in-memory zstd compression')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
@@ -2457,7 +2452,7 @@ fn main() {
 		is_locktime = true
 	} else {
 		for a in args {
-			if a in ['--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '-s0', '--seed0', '-s1', '--seed1', '-s2', '--seed2'] {
+			if a in ['--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred'] {
 				is_locktime = true
 				break
 			}
@@ -2482,9 +2477,6 @@ fn main() {
 	mut text_input := ''
 	mut ref_text := ''
 	mut password := ''
-	mut seed0_str := ''
-	mut seed1_str := ''
-	mut seed2_str := ''
 	mut seed_val := ''
 	mut raw_formats := ''
 	mut typo_intensity := 0
@@ -2505,9 +2497,6 @@ fn main() {
 				'-o', '--out' { if i + 1 < args.len { out_path = args[i+1]; i++ } }
 				'-t', '--time' { if i + 1 < args.len { duration = args[i+1].u64(); i++ } }
 				'-p', '--pass' { if i + 1 < args.len { password = args[i+1]; i++ } }
-				'-s0', '--seed0' { if i + 1 < args.len { seed0_str = args[i+1]; i++ } }
-				'-s1', '--seed1' { if i + 1 < args.len { seed1_str = args[i+1]; i++ } }
-				'-s2', '--seed2' { if i + 1 < args.len { seed2_str = args[i+1]; i++ } }
 				'--mem' { if i + 1 < args.len { mem = args[i+1].u32(); i++ } }
 				'--iter' { if i + 1 < args.len { iter = args[i+1].u32(); i++ } }
 				'--threads' { if i + 1 < args.len { threads = u8(args[i+1].int()); i++ } }
@@ -2535,22 +2524,13 @@ fn main() {
 		if password == '' {
 			password = os.input_password('Enter Master Password: ') or { panic(err) }
 		}
-		if seed0_str == '' {
-			seed0_str = os.input_password('Enter Seed 0 (Header Key): ') or { panic(err) }
-		}
-		if seed1_str == '' {
-			seed1_str = os.input_password('Enter Seed 1 (VDF Key): ') or { panic(err) }
-		}
-		if seed2_str == '' {
-			seed2_str = os.input_password('Enter Seed 2 (Payload Key): ') or { panic(err) }
-		}
 
 		if mode == 'encrypt' {
 			if out_path == '' {
 				eprintln('error: output container path (-o or --out) is required for encryption')
 				return
 			}
-			locktime_encrypt_flow(file_path, out_path, duration, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, shred_orig, use_compression) or {
+			locktime_encrypt_flow(file_path, out_path, duration, password, mem, iter, threads, pbkdf2_iter, shred_orig, use_compression) or {
 				eprintln('error: encryption failed: ${err}')
 			}
 		} else if mode == 'decrypt' {
@@ -2558,11 +2538,11 @@ fn main() {
 				eprintln('error: output directory path (-o or --out) is required for decryption')
 				return
 			}
-			locktime_decrypt_flow(file_path, out_path, duration, password, seed0_str, seed1_str, seed2_str, pbkdf2_iter, shred_orig) or {
+			locktime_decrypt_flow(file_path, out_path, duration, password, pbkdf2_iter, shred_orig) or {
 				eprintln('error: decryption failed: ${err}')
 			}
 		} else if mode == 'mount' {
-			run_mount_flow(file_path, duration, password, seed0_str, seed1_str, seed2_str, mem, iter, threads, pbkdf2_iter, use_compression) or {
+			run_mount_flow(file_path, duration, password, mem, iter, threads, pbkdf2_iter, use_compression) or {
 				eprintln('error: mount failed: ${err}')
 			}
 		}
@@ -2575,7 +2555,7 @@ fn main() {
 				'-r', '--ref' { if i + 1 < args.len { ref_text = args[i + 1]; i++ } }
 				'-p', '--pass' { if i + 1 < args.len { password = args[i + 1]; i++ } }
 				'-s', '--seed' { if i + 1 < args.len { seed_val = args[i + 1]; i++ } }
-				'-f', '--formats' { if i + 1 < args.len { raw_formats = args[i + 1]; i++ } }
+				'-f', '--formats' { if i + 1 < args.len { raw_formats = args[i+1]; i++ } }
 				'-ti', '--typo-intensity' { if i + 1 < args.len { typo_intensity = args[i + 1].int(); i++ } }
 				'-tc', '--typo-chars' { if i + 1 < args.len { typo_chars = args[i + 1]; i++ } }
 				'-km', '--key-map' { if i + 1 < args.len { key_map = args[i + 1]; i++ } }
@@ -2674,7 +2654,7 @@ fn get_safe_destination_path(base_dir string, rel_path string) !string {
     }
     
     if clean_parts.len == 0 {
-        return error('salty: empty filename inside container')
+        return error('salty: write failed. empty target filename.')
     }
     
     clean_rel := clean_parts.join(os.path_separator)
