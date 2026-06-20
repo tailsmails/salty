@@ -12,10 +12,10 @@ Designed for strict forensic security, Salty utilizes UNIX RAM-backed file struc
 - **Memory-Hard Sequential Cryptographic Delay Chain**: Implements a sequential delay chain utilizing memory-hard SHA-3-512 to prevent ASIC bypasses.
     - *ASIC/GPU Resistance via Memory Latency Bounds*: Standard SHA-3 sequential chains can be parallelized or pipelined heavily on custom FPGAs. By routing Salty's chain through a data-dependent random walk on a 1 MB buffer (16,384 hashes, optimized for CPU L2 cache size), the execution speed is strictly bounded by hardware memory/cache latency. This minimizes the performance gap between specialized custom silicon and consumer-grade CPUs.
     - *No-Trapdoor Security*: Salty avoids the slow generation of safe primes ($p, q$) required by RSW96 VDFs, enabling instant encryption. Since there is no algebraic trapdoor, even the creator of the container must compute the sequential delay, enforcing a strict mathematical timeline.
-    - *Constant-Time $O(1)$ Parameter Masking (`Seed0`)*: Metadata parameters (duration $t$, Argon2 iterations, memory, thread count, cipher length) are decrypted in constant $O(1)$ time. A wrong seed simply produces garbage metadata that fails authenticated payload decryption at the very end, eliminating timing side-channels and oracle leaks.
+    - *Constant-Time $O(1)$ Parameter Masking (`Seed0`)*: Metadata parameters (duration $t$, Argon2 iterations, memory, thread count, cipher length) are decrypted in constant $O(1)$ time. A wrong key simply produces garbage metadata that fails authenticated payload decryption at the very end, eliminating timing side-channels and oracle leaks.
 - **Double-Layer Cascade Encryption**: Payloads are processed through a two-layer cryptographic pipeline. The compressed virtual filesystem is first encrypted with **AES-256-CTR** (inner layer) and then enveloped inside **ChaCha20-Poly1305** (outer AEAD layer), deriving independent cryptographically-hashed keys for each layer. This dual-cipher design ensures mathematical resistance even if a theoretical vulnerability is discovered in either cipher.
 - **Delay-to-Header Binding**: To prevent local verification oracle attacks, the metadata decryption key (`header_key`) is cryptographically bound to the final state of the hash chain ($w$) using PBKDF2-SHA3-512.
-- **Quad-Key Security Model**: Decouples config parameters, block locations, and payload encryption via four distinct keys (**Master Password**, **Seed 0**, **Seed 1**, **Seed 2**).
+- **Unified Master Key-Binding Model**: Config parameters, block locations, and payload encryption are securely decoupled using four distinct keys (**Master Password**, **Seed 0**, **Seed 1**, **Seed 2**). However, to eliminate manual input fatigue and prevent multi-prompt workflows, **Seed 0, Seed 1, and Seed 2 are deterministically and securely derived** from the **Master Password** under the hood using PBKDF2-SHA3-512 with cryptographically isolated salts. This binds the entire cryptographic pipeline exclusively to the master key.
 - **Virtual VFS Packer (Directory Cryptography)**: Recursively walks any target directory tree, compiling all directory structures, files, metadata, and contents into a unified virtual filesystem structure (VFS) compressed with in-memory **Zstd** before encryption.
 
 ### 2. RAM-Mounted Sandbox & Unix Bind-Mount
@@ -28,7 +28,7 @@ Designed for strict forensic security, Salty utilizes UNIX RAM-backed file struc
 ### 3. Salty Steganography Engine (Triple-Stream Evasion)
 - **Square-Root Law Compliance**: Typo intensity is dynamically capped at 25% in textual steganography to preserve the linguistic and statistical naturalness of the cover text, rendering NLP-based steganalysis classifiers ineffective.
 - **Textual Mode**: Conceals data inside cover texts via deterministic typing pattern mimicry: character insertions, overwrites (`-o`), transpositions (`-tr`), or standard US-QWERTY proximity keyboard typos.
-- **Numeric Mode**: Conceals payload data inside patterns mimicking credit cards, routing numbers, or phone sequences.
+- **Numeric Mode**: Conceals payload data inside highly audited and censored serial sequences, national registry formats, or state-controlled telecommunication networks. This includes exact patterns mimicking the **Chinese Resident Identity Card (SFZ)**, **Iranian National ID (Melli Code)**, and regional financial or telco routing lines associated with strictly monitored jurisdictions.
 
 ### 4. Character-Mapping Obfuscator (`obfuscate`)
 - **Randomized Homoglyph Translation**: Replaces characters with visual homoglyphs based on user-defined custom mapping strings.
@@ -58,19 +58,19 @@ pkg update -y && pkg install -y git clang make zstd && if ! command -v v >/dev/n
 
 **Encrypt a Directory or File recursively:**
 ```bash
-sudo ./salty encrypt -f ./my_project -o secure.container -t 100000 -p "MasterPass" -s0 "Key0" -s1 "Key1" -s2 "Key2" -sh
+sudo ./salty encrypt -f ./my_project -o secure.container -t 100000 -p "MasterPass" -sh
 ```
-*(Use `-sh` or `--shred` to securely shred the original files after successful encryption)*
+*(Use `-sh` or `--shred` to securely shred the original files after successful encryption. Seed parameters are derived securely and automatically under the hood)*
 
 **Mount/Load a Container to RAM (Expose Files on `./mnt/`):**
 ```bash
-sudo ./salty mount -f secure.container -t 100000 -p "MasterPass" -s0 "Key0" -s1 "Key1" -s2 "Key2"
+sudo ./salty mount -f secure.container -t 100000 -p "MasterPass"
 ```
 *(Simply press **ENTER** when finished to automatically serialize modifications back to the container, lazy-unmount, and shred RAM files)*
 
 **Decrypt/Extract a Container to Disk:**
 ```bash
-sudo ./salty decrypt -f secure.container -o ./restored_project -p "MasterPass" -s0 "Key0" -s1 "Key1" -s2 "Key2"
+sudo ./salty decrypt -f secure.container -o ./restored_project -p "MasterPass"
 ```
 
 **Force Unmount & Clean Orphan Mounts:**
@@ -84,9 +84,9 @@ sudo ./salty unmount -f ./mnt/secure_salty
 
 ### 2. Steganography Mode
 
-**Conceal message inside Numeric sequences:**
+**Conceal message inside Numeric sequences (mimicking Chinese SFZ, Iranian Melli ID, and state-monitored phone routing):**
 ```bash
-./salty encrypt -m "Secret payload data" -p "CryptPass" -s "SeedString" -f "+98912:7,6037:10"
+./salty encrypt -m "Secret payload data" -p "CryptPass" -s "SeedString" -f "SFZ:18,MELLI:10,+86139:11,+98912:7"
 ```
 
 **Conceal message inside Textual carrier via typos/transpositions:**
@@ -120,7 +120,7 @@ Launches a quiet, step-by-step CLI setup wizard guiding you through numeric obfu
 
 ## Security Model
 1. **Memory-Hard VDF Delay**: Forces a single-threaded sequential execution time of $T$ seconds that cannot be bypassed by parallel processing, GPU/ASIC pipelines, or algebraic shortcuts.
-2. **Mathematical Key Binding**: Deriving the metadata decryption key from the sequential state prevents bypasses via binary modification.
+2. **Mathematical Key Binding**: Deriving the metadata decryption key and block-shuffling seeds (`Seed0`, `Seed1`, `Seed2`) directly from the master password prevents verification bypasses and isolates cryptographic layers without exposing parameters on-disk.
 3. **Paging Protection**: Uses active OS memory pinning (`mlock`) to limit the lifetime of secret keys in hardware and prevent disk paging.
 4. **Physical Write Evasion**: Storing temporary unencrypted files strictly inside a private, restricted `tmpfs` RAM-disk eliminates forensic discovery risks on physical SSD/HDD flash storage.
 
