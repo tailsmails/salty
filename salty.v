@@ -1105,7 +1105,7 @@ fn execute_unmount(mount_point string, safe_erp string) ! {
 	}
 }
 
-fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, pbkdf2_iter int) ![]u8 { 
+fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, seed1 string, seed2 string, pbkdf2_iter int) ![]u8 { 
 	if !os.exists(file_path) { return error('salty: container path not found') } 
 
 	mut infile := os.open(file_path) or {
@@ -1142,8 +1142,6 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, pbk
 	println(term.gray('salty: sequential delay chain completed in ${time.since(start_time).seconds():.2f}s.'))
 	
 	seed0_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed0_salt'.bytes(), 5000, 32).hex()
-	seed1_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed1_salt'.bytes(), 5000, 32).hex()
-	seed2_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed2_salt'.bytes(), 5000, 32).hex()
 	
 	mut masked_mixed_size := []u8{len: 4}
 	n_size := infile.read(mut masked_mixed_size) or {
@@ -1168,7 +1166,7 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, pbk
 	if n_mixed < int(mixed_len) { return error('salty: truncated file structure') }
 
 	total_len := mixed.len
-	mut seed_bytes1 := derive_seed1(seed1_derived, file_salt, pbkdf2_iter)!
+	mut seed_bytes1 := derive_seed1(seed1, file_salt, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes1); zeroize(mut seed_bytes1) }
 
 	mut all_indices := []int{len: total_len}
@@ -1252,7 +1250,7 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, pbk
 	lock_memory(mut session_iv)
 	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
 
-	mut seed_bytes2 := derive_seed2(seed2_derived, x_bytes, pbkdf2_iter)!
+	mut seed_bytes2 := derive_seed2(seed2, x_bytes, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
 
 	mut shuffle_rng2 := SecurePRNG{seed: seed_bytes2}
@@ -1315,7 +1313,7 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, pbk
 }
 
 fn locktime_encrypt_mem(vfs_payload []u8, out_path string, duration_sec u64,
-password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression bool) ! { 
+password string, seed1 string, seed2 string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression bool) ! { 
 	temp_rand := secure_random_bytes(4) or { []u8{len: 4, init: 0xaa} }
 	temp_path := out_path + '.tmp.' + temp_rand.hex()
 	
@@ -1332,8 +1330,6 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression
 	}
 	
 	seed0_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed0_salt'.bytes(), 5000, 32).hex()
-	seed1_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed1_salt'.bytes(), 5000, 32).hex()
-	seed2_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed2_salt'.bytes(), 5000, 32).hex()
 
 	file_salt := secure_random_bytes(32)!
 	outfile.write(file_salt)!
@@ -1371,10 +1367,10 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression
 	lock_memory(mut session_iv)
 	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
 
-	mut seed_bytes1 := derive_seed1(seed1_derived, file_salt, pbkdf2_iter)!
+	mut seed_bytes1 := derive_seed1(seed1, file_salt, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes1); zeroize(mut seed_bytes1) }
 
-	mut seed_bytes2 := derive_seed2(seed2_derived, w_trapdoor_bytes, pbkdf2_iter)!
+	mut seed_bytes2 := derive_seed2(seed2, w_trapdoor_bytes, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
 
 	chunk_size := 1024 * 1024
@@ -1527,7 +1523,7 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression
 	success = true
 }
 
-fn run_mount_flow(container_path string, duration u64, password string,
+fn run_mount_flow(container_path string, duration u64, password string, seed1 string, seed2 string,
 	mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression bool) ! {
 
 	if !os.exists(container_path) {
@@ -1602,7 +1598,7 @@ fn run_mount_flow(container_path string, duration u64, password string,
 	defer { unlock_memory(mut temp_key); zeroize(mut temp_key) }
 
 	println(term.gray('salty: decrypting container...'))
-	decrypted_data := locktime_decrypt_mem(container_path, duration, password, pbkdf2_iter)!
+	decrypted_data := locktime_decrypt_mem(container_path, duration, password, seed1, seed2, pbkdf2_iter)!
 	mut files := deserialize_vfs(decrypted_data, temp_key)!
 	println(term.gray('salty: decryption finished. unpacking...'))
 
@@ -1658,7 +1654,7 @@ fn run_mount_flow(container_path string, duration u64, password string,
 			continue
 		}
 		
-		locktime_encrypt_mem(serialized, container_path, duration, password, mem, iter, threads, pbkdf2_iter, use_compression) or {
+		locktime_encrypt_mem(serialized, container_path, duration, password, seed1, seed2, mem, iter, threads, pbkdf2_iter, use_compression) or {
 			println(term.red('salty: save failed: could not encrypt and update container: ${err.msg()}'))
 			println(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue (e.g. check permissions/disk space) and try again.'))
 			continue
@@ -1690,7 +1686,7 @@ fn run_mount_flow(container_path string, duration u64, password string,
 }
 
 fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64,
-password string, mem u32, iter u32, threads u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! { 
+password string, seed1 string, seed2 string, mem u32, iter u32, threads u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! { 
 	verify_write_permission(out_path)!
 
 	mut temp_key := secure_random_bytes(32)!
@@ -1699,7 +1695,7 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, shred_orig bool
 
 	mut files := pack_source_to_vfs(file_path, temp_key)!
 	serialized := serialize_vfs(mut files, temp_key)!
-	locktime_encrypt_mem(serialized, out_path, duration_sec, password, mem, iter, threads, pbkdf2_iter, use_compression)!
+	locktime_encrypt_mem(serialized, out_path, duration_sec, password, seed1, seed2, mem, iter, threads, pbkdf2_iter, use_compression)!
 
 	verify_written_container(out_path, 262180) or {
 		return error('salty: safety check failed. Encrypted container not verified. Original files left untouched. Details: ${err.msg()}')
@@ -1716,14 +1712,14 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, shred_orig bool
 	}
 }
 
-fn locktime_decrypt_flow(file_path string, out_path string, duration_sec u64, password string,
+fn locktime_decrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1 string, seed2 string,
 pbkdf2_iter int, shred_orig bool) ! { 
 	if !os.exists(file_path) { return error('salty: input container not found') }
 	
 	os.mkdir_all(out_path) or {}
 	check_dir_write_permission(out_path)!
 
-	decrypted_data := locktime_decrypt_mem(file_path, duration_sec, password, pbkdf2_iter)!
+	decrypted_data := locktime_decrypt_mem(file_path, duration_sec, password, seed1, seed2, pbkdf2_iter)!
 
 	mut temp_key := secure_random_bytes(32)!
 	lock_memory(mut temp_key)
@@ -2317,11 +2313,16 @@ fn run_salty_interactive() ! {
 			if ans == 'y' { is_new = true } else { return }
 		}
 		password := os.input_password('Enter Master Password: ')!
+		seed1 := os.input_password('Enter Seed 1: ') or { "" }
+		seed2 := os.input_password('Enter Seed 2: ') or { "" }
+		if seed1 == '' || seed2 == '' {
+			return error('salty: Seed 1 and Seed 2 cannot be empty')
+		}
 		duration_str := os.input('Enter Time Lock iterations (default 100000): ').trim_space()
 		duration := if duration_str == '' { u64(100000) } else { duration_str.u64() }
 		compress_ans := os.input('Use compression? (y/n): ').trim_space().to_lower()
 		use_compression := compress_ans == 'y'
-		run_mount_flow(file_path, duration, password, 65536, 3, 4, 200000, use_compression)!
+		run_mount_flow(file_path, duration, password, seed1, seed2, 65536, 3, 4, 200000, use_compression)!
 		return
 	}
 	if method == '1' || method == '2' {
@@ -2406,6 +2407,8 @@ fn print_help() {
 	println('  -o, --out <path>           Output container file or decrypted folder path')
 	println('  -t, --time <iterations>    VDF sequential delay chain iteration count (Default: 100000)')
 	println('  -p, --pass <password>      Master password for cryptographic protection')
+	println('  --seed1 <seed1>            Seed 1 for index shuffling')
+	println('  --seed2 <seed2>            Seed 2 for payload shuffling')
 	println('  -sh, --shred               Securely shred the original source after execution')
 	println('  -c, --compress             Enable in-memory zstd compression')
 	println('  --mem <KB>                 Argon2 Memory in KB (Default: 65536)')
@@ -2452,7 +2455,7 @@ fn main() {
 		is_locktime = true
 	} else {
 		for a in args {
-			if a in ['--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred'] {
+			if a in ['--threads', '--mem', '--iter', '--out', '--pbkdf2-iter', '-sh', '--shred', '--seed1', '--seed2'] {
 				is_locktime = true
 				break
 			}
@@ -2478,6 +2481,8 @@ fn main() {
 	mut ref_text := ''
 	mut password := ''
 	mut seed_val := ''
+	mut seed1 := ''
+	mut seed2 := ''
 	mut raw_formats := ''
 	mut typo_intensity := 0
 	mut typo_chars := ''
@@ -2497,6 +2502,8 @@ fn main() {
 				'-o', '--out' { if i + 1 < args.len { out_path = args[i+1]; i++ } }
 				'-t', '--time' { if i + 1 < args.len { duration = args[i+1].u64(); i++ } }
 				'-p', '--pass' { if i + 1 < args.len { password = args[i+1]; i++ } }
+				'--seed1' { if i + 1 < args.len { seed1 = args[i+1]; i++ } }
+				'--seed2' { if i + 1 < args.len { seed2 = args[i+1]; i++ } }
 				'--mem' { if i + 1 < args.len { mem = args[i+1].u32(); i++ } }
 				'--iter' { if i + 1 < args.len { iter = args[i+1].u32(); i++ } }
 				'--threads' { if i + 1 < args.len { threads = u8(args[i+1].int()); i++ } }
@@ -2525,12 +2532,20 @@ fn main() {
 			password = os.input_password('Enter Master Password: ') or { panic(err) }
 		}
 
+		if seed1 == '' {
+			seed1 = os.input_password('Enter Seed 1: ') or { panic(err) }
+		}
+
+		if seed2 == '' {
+			seed2 = os.input_password('Enter Seed 2: ') or { panic(err) }
+		}
+
 		if mode == 'encrypt' {
 			if out_path == '' {
 				eprintln('error: output container path (-o or --out) is required for encryption')
 				return
 			}
-			locktime_encrypt_flow(file_path, out_path, duration, password, mem, iter, threads, pbkdf2_iter, shred_orig, use_compression) or {
+			locktime_encrypt_flow(file_path, out_path, duration, password, seed1, seed2, mem, iter, threads, pbkdf2_iter, shred_orig, use_compression) or {
 				eprintln('error: encryption failed: ${err}')
 			}
 		} else if mode == 'decrypt' {
@@ -2538,11 +2553,11 @@ fn main() {
 				eprintln('error: output directory path (-o or --out) is required for decryption')
 				return
 			}
-			locktime_decrypt_flow(file_path, out_path, duration, password, pbkdf2_iter, shred_orig) or {
+			locktime_decrypt_flow(file_path, out_path, duration, password, seed1, seed2, pbkdf2_iter, shred_orig) or {
 				eprintln('error: decryption failed: ${err}')
 			}
 		} else if mode == 'mount' {
-			run_mount_flow(file_path, duration, password, mem, iter, threads, pbkdf2_iter, use_compression) or {
+			run_mount_flow(file_path, duration, password, seed1, seed2, mem, iter, threads, pbkdf2_iter, use_compression) or {
 				eprintln('error: mount failed: ${err}')
 			}
 		}
