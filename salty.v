@@ -1119,6 +1119,11 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, pbk
 		return error('salty: failed to read salt: ${err.msg()}')
 	}
 	if n_salt < 32 { return error('salty: invalid file size') }
+
+	mut mask_input := []u8{cap: password.len + file_salt.len}
+	for b in password.bytes() { mask_input << b }
+	for b in file_salt { mask_input << b }
+	mask_stream := sha3.sum512(mask_input)
 	
 	mut t_val := duration_sec
 	if t_val < 2 { t_val = 2 }
@@ -1136,32 +1141,9 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, pbk
 	defer { unlock_memory(mut x_bytes); zeroize(mut x_bytes) }
 	println(term.gray('salty: sequential delay chain completed in ${time.since(start_time).seconds():.2f}s.'))
 	
-	mut master_entropy_input := []u8{cap: password.len + file_salt.len + x_bytes.len}
-	for b in password.bytes() { master_entropy_input << b }
-	for b in file_salt { master_entropy_input << b }
-	for b in x_bytes { master_entropy_input << b }
-	master_entropy := sha3.sum512(master_entropy_input)
-	
-	mut seed0_input := []u8{cap: 64 + 5}
-	for b in master_entropy { seed0_input << b }
-	for b in "seed0".bytes() { seed0_input << b }
-	seed0_derived := sha3.sum512(seed0_input).hex()
-
-	mut seed1_input := []u8{cap: 64 + 5}
-	for b in master_entropy { seed1_input << b }
-	for b in "seed1".bytes() { seed1_input << b }
-	seed1_derived := sha3.sum512(seed1_input).hex()
-
-	mut seed2_input := []u8{cap: 64 + 5}
-	for b in master_entropy { seed2_input << b }
-	for b in "seed2".bytes() { seed2_input << b }
-	seed2_derived := sha3.sum512(seed2_input).hex()
-	
-	mut mask_input := []u8{cap: password.len + file_salt.len + x_bytes.len}
-	for b in password.bytes() { mask_input << b }
-	for b in file_salt { mask_input << b }
-	for b in x_bytes { mask_input << b }
-	mask_stream := sha3.sum512(mask_input)
+	seed0_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed0_salt'.bytes(), 5000, 32).hex()
+	seed1_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed1_salt'.bytes(), 5000, 32).hex()
+	seed2_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed2_salt'.bytes(), 5000, 32).hex()
 	
 	mut masked_mixed_size := []u8{len: 4}
 	n_size := infile.read(mut masked_mixed_size) or {
@@ -1348,6 +1330,10 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression
 			os.rm(temp_path) or {}
 		}
 	}
+	
+	seed0_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed0_salt'.bytes(), 5000, 32).hex()
+	seed1_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed1_salt'.bytes(), 5000, 32).hex()
+	seed2_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed2_salt'.bytes(), 5000, 32).hex()
 
 	file_salt := secure_random_bytes(32)!
 	outfile.write(file_salt)!
@@ -1369,27 +1355,6 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression
 	lock_memory(mut w_trapdoor_bytes)
 	defer { unlock_memory(mut w_trapdoor_bytes); zeroize(mut w_trapdoor_bytes) }
 	
-	mut master_entropy_input := []u8{cap: password.len + file_salt.len + w_trapdoor_bytes.len}
-	for b in password.bytes() { master_entropy_input << b }
-	for b in file_salt { master_entropy_input << b }
-	for b in w_trapdoor_bytes { master_entropy_input << b }
-	master_entropy := sha3.sum512(master_entropy_input)
-	
-	mut seed0_input := []u8{cap: 64 + 5}
-	for b in master_entropy { seed0_input << b }
-	for b in "seed0".bytes() { seed0_input << b }
-	seed0_derived := sha3.sum512(seed0_input).hex()
-
-	mut seed1_input := []u8{cap: 64 + 5}
-	for b in master_entropy { seed1_input << b }
-	for b in "seed1".bytes() { seed1_input << b }
-	seed1_derived := sha3.sum512(seed1_input).hex()
-
-	mut seed2_input := []u8{cap: 64 + 5}
-	for b in master_entropy { seed2_input << b }
-	for b in "seed2".bytes() { seed2_input << b }
-	seed2_derived := sha3.sum512(seed2_input).hex()
-
 	mut header_key_material := []u8{cap: password.len + w_trapdoor_bytes.len}
 	for b in password.bytes() { header_key_material << b }
 	for b in w_trapdoor_bytes { header_key_material << b }
@@ -1405,15 +1370,6 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression
 	mut session_iv := secure_random_bytes(16)!
 	lock_memory(mut session_iv)
 	defer { unlock_memory(mut session_iv); zeroize(mut session_iv) }
-	
-	mut chunk_size_seed := []u8{cap: session_key.len + session_iv.len}
-	for b in session_key { chunk_size_seed << b }
-	for b in session_iv { chunk_size_seed << b }
-	chunk_size_hash := sha3.sum512(chunk_size_seed)
-	mut chunk_size_rng := SecurePRNG{seed: chunk_size_hash.clone()}
-
-	min_chunk := 256 * 1024   // 256 KB
-	max_chunk := 1536 * 1024  // 1.5 MB
 
 	mut seed_bytes1 := derive_seed1(seed1_derived, file_salt, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes1); zeroize(mut seed_bytes1) }
@@ -1421,11 +1377,11 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression
 	mut seed_bytes2 := derive_seed2(seed2_derived, w_trapdoor_bytes, pbkdf2_iter)!
 	defer { unlock_memory(mut seed_bytes2); zeroize(mut seed_bytes2) }
 
+	chunk_size := 1024 * 1024
 	mut first_chunk_raw := []u8{}
 	mut payload_offset := 0
 	
-	first_chunk_target := chunk_size_rng.intn(max_chunk - min_chunk) + min_chunk
-	first_chunk_len := if vfs_payload.len < first_chunk_target { vfs_payload.len } else { first_chunk_target }
+	first_chunk_len := if vfs_payload.len < chunk_size { vfs_payload.len } else { chunk_size }
 	if first_chunk_len > 0 {
 		first_chunk_raw = vfs_payload[0 .. first_chunk_len].clone()
 		payload_offset += first_chunk_len
@@ -1500,11 +1456,10 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression
 		remaining_indices[i], remaining_indices[j] = remaining_indices[j], remaining_indices[i]
 	}
 	for i in 0 .. first_chunk_cipher.len { mixed[remaining_indices[i]] = first_chunk_cipher[i] }
-	
-	mut mask_input := []u8{cap: password.len + file_salt.len + w_trapdoor_bytes.len}
+
+	mut mask_input := []u8{cap: password.len + file_salt.len}
 	for b in password.bytes() { mask_input << b }
 	for b in file_salt { mask_input << b }
-	for b in w_trapdoor_bytes { mask_input << b }
 	mask_stream := sha3.sum512(mask_input)
 
 	mut mixed_size_buf := []u8{}
@@ -1521,10 +1476,7 @@ password string, mem u32, iter u32, threads u8, pbkdf2_iter int, use_compression
 	mut chunk_index := u64(1)
 	for payload_offset < vfs_payload.len {
 		rem_len := vfs_payload.len - payload_offset
-		
-		chunk_target := chunk_size_rng.intn(max_chunk - min_chunk) + min_chunk
-		to_read := if rem_len < chunk_target { rem_len } else { chunk_target }
-		
+		to_read := if rem_len < chunk_size { rem_len } else { chunk_size }
 		chunk_data := vfs_payload[payload_offset .. payload_offset + to_read].clone()
 		payload_offset += to_read
 
