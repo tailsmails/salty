@@ -223,12 +223,12 @@ fn check_mlock_capability() {
 		$if windows {
 			res := C.VirtualLock(test_buf.data, test_buf.len)
 			if res == 0 {
-				println(term.gray('salty: memory locking is restricted. swapping might occur.'))
+				eprintln(term.gray('salty: memory locking is restricted. swapping might occur.'))
 			}
 		} $else {
 			res := C.mlock(test_buf.data, test_buf.len)
 			if res != 0 {
-				println(term.gray('salty: memory locking (mlock) is restricted by system limits.'))
+				eprintln(term.gray('salty: memory locking (mlock) is restricted by system limits.'))
 			} else {
 				C.munlock(test_buf.data, test_buf.len)
 			}
@@ -525,6 +525,20 @@ fn zeroize(mut b []u8) {
 	}
 }
 
+fn read_all_stdin() []u8 {
+	mut std_in := os.stdin()
+	mut data := []u8{}
+	mut buf := []u8{len: 4096}
+	for {
+		n := std_in.read(mut buf) or { 0 }
+		if n <= 0 {
+			break
+		}
+		data << buf[0..n]
+	}
+	return data
+}
+
 fn secure_shred_file(path string) bool {
 	if !os.exists(path) { return true }
 	size := os.file_size(path)
@@ -595,7 +609,7 @@ fn run_sequential_delay(initial_state []u8, t u64, show_progress bool) []u8 {
 		buf[idx] = state.clone()
 		
 		if show_progress && i % progress_interval == 0 && i > 0 {
-			println(term.gray('salty: computing delay chain progress: ${(i * 100) / t}%'))
+			eprintln(term.gray('salty: computing delay chain progress: ${(i * 100) / t}%'))
 		}
 	}
 	return state
@@ -650,7 +664,7 @@ fn deserialize_header(b []u8, key_seed0 []u8, file_salt []u8) !DecryptedHeader {
     comp_val := decode_from_seed0(b[160..192], key_seed0, 5, 'use_comp')!
     use_comp := comp_val == 1
     
-    println(term.gray('salty: header metadata extracted (t=${t_val}, mem=${mem}, len=${cipher_len})'))
+    eprintln(term.gray('salty: header metadata extracted (t=${t_val}, mem=${mem}, len=${cipher_len})'))
 
     offset := 192
     key_len := read_u32(b, offset)
@@ -879,7 +893,19 @@ fn get_all_files_recursive(dir_path string) ![]string {
 
 fn pack_source_to_vfs(source_path string, temp_key []u8) ![]MemFile {
 	mut files := []MemFile{}
-	if os.is_dir(source_path) {
+	if source_path == '-' {
+		mut content := read_all_stdin()
+		lock_memory(mut content)
+		defer { unlock_memory(mut content); zeroize(mut content) }
+		
+		enc := encrypt_vfs_file(content, temp_key)!
+		files << MemFile{
+			name: 'stdin'
+			is_loaded: false
+			plain_data: []u8{}
+			enc_data: enc
+		}
+	} else if os.is_dir(source_path) {
 		all_paths := get_all_files_recursive(source_path) or {
 			return error('salty: failed to scan source directory "${source_path}": ${err.msg()}')
 		}
@@ -927,8 +953,24 @@ fn pack_source_to_vfs(source_path string, temp_key []u8) ![]MemFile {
 }
 
 fn unpack_vfs_to_folder(files []MemFile, output_folder string, temp_key []u8) ! {
+    if output_folder == '-' {
+        mut out := os.stdout()
+        for f in files {
+            mut plain := []u8{}
+            if f.is_loaded {
+                plain = f.plain_data.clone()
+            } else {
+                plain = decrypt_vfs_file(f.enc_data, temp_key)!
+            }
+            out.write(plain) or {
+                return error('salty: stdout write failed')
+            }
+            zeroize(mut plain)
+        }
+        return
+    }
+
     os.mkdir_all(output_folder) or {}
-    
     real_base := os.real_path(output_folder)
     
     for f in files {
@@ -1076,11 +1118,11 @@ fn execute_unmount(mount_point string, safe_erp string) ! {
 	safe_mount_point := sanitize_path(mount_point)
 	
 	if is_mounted(mount_point) {
-		println(term.gray('salty: unmounting "${mount_point}"...'))
+		eprintln(term.gray('salty: unmounting "${mount_point}"...'))
 		if !run_cmd('umount ${safe_mount_point}') {
-			println(term.gray('salty: standard umount failed. trying lazy umount...'))
+			eprintln(term.gray('salty: standard umount failed. trying lazy umount...'))
 			if !run_cmd('umount -l ${safe_mount_point}') {
-				println(term.red('salty: error: could not unmount "${mount_point}"'))
+				eprintln(term.red('salty: error: could not unmount "${mount_point}"'))
 				return error('salty: mount point is busy. close all files accessing it.')
 			}
 		}
@@ -1089,7 +1131,7 @@ fn execute_unmount(mount_point string, safe_erp string) ! {
 	
 	if safe_erp != '' && os.exists(safe_erp) {
 		if is_mounted(safe_erp) {
-			println(term.gray('salty: unmounting dedicated RAM disk...'))
+			eprintln(term.gray('salty: unmounting dedicated RAM disk...'))
 			safe_erp_path := sanitize_path(safe_erp)
 			if !run_cmd('umount ${safe_erp_path}') {
 				run_cmd('umount -l ${safe_erp_path}')
@@ -1106,14 +1148,22 @@ fn execute_unmount(mount_point string, safe_erp string) ! {
 }
 
 fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, seed1 string, seed2 string, pbkdf2_iter int) ![]u8 { 
-	if !os.exists(file_path) { return error('salty: container path not found') } 
+	if file_path != '-' && !os.exists(file_path) { return error('salty: container path not found') } 
 
-	mut infile := os.open(file_path) or {
-		return error('salty: failed to open container: ${err.msg()}')
+	mut infile := if file_path == '-' {
+		os.stdin()
+	} else {
+		os.open(file_path) or {
+			return error('salty: failed to open container: ${err.msg()}')
+		}
 	}
-	defer { infile.close() }
+	defer {
+		if file_path != '-' {
+			infile.close()
+		}
+	}
 
-	println(term.gray('salty: reading container...'))
+	eprintln(term.gray('salty: reading container...'))
 	mut file_salt := []u8{len: 32}
 	n_salt := infile.read(mut file_salt) or {
 		return error('salty: failed to read salt: ${err.msg()}')
@@ -1133,13 +1183,13 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, see
 	for b in file_salt { data_a << b }
 	initial_state := sha3.sum512(data_a)
 
-	println(term.gray('salty: computing sequential delay chain (t=${t_val})...'))
+	eprintln(term.gray('salty: computing sequential delay chain (t=${t_val})...'))
 	start_time := time.now()
 	
 	mut x_bytes := run_sequential_delay(initial_state, t_val, true)
 	lock_memory(mut x_bytes)
 	defer { unlock_memory(mut x_bytes); zeroize(mut x_bytes) }
-	println(term.gray('salty: sequential delay chain completed in ${time.since(start_time).seconds():.2f}s.'))
+	eprintln(term.gray('salty: sequential delay chain completed in ${time.since(start_time).seconds():.2f}s.'))
 	
 	seed0_derived := pbkdf2_sha3_512(password.bytes(), 'mimicfs_seed0_salt'.bytes(), 5000, 32).hex()
 	
@@ -1267,7 +1317,7 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, see
 		}
 	}
 
-	println(term.gray('salty: decrypting payload...'))
+	eprintln(term.gray('salty: decrypting payload...'))
 	first_chunk_raw := decrypt_chunk(first_chunk_cipher, session_key, session_iv, 0, header.use_compression) or {
 		return error('salty: decryption failure. configuration parameters incorrect.')
 	}
@@ -1308,7 +1358,9 @@ fn locktime_decrypt_mem(file_path string, duration_sec u64, password string, see
 		chunk_index++
 	}
 
-	infile.close()
+	if file_path != '-' {
+		infile.close()
+	}
 	return out_buf
 }
 
@@ -1317,15 +1369,21 @@ password string, seed1 string, seed2 string, mem u32, iter u32, threads u8, pbkd
 	temp_rand := secure_random_bytes(4) or { []u8{len: 4, init: 0xaa} }
 	temp_path := out_path + '.tmp.' + temp_rand.hex()
 	
-	mut outfile := os.create(temp_path) or {
-		return error('salty: failed to create temporary container file: ${err.msg()}')
+	mut outfile := if out_path == '-' {
+		os.stdout()
+	} else {
+		os.create(temp_path) or {
+			return error('salty: failed to create temporary container file: ${err.msg()}')
+		}
 	}
 	
 	mut success := false
 	defer {
-		outfile.close()
-		if !success {
-			os.rm(temp_path) or {}
+		if out_path != '-' {
+			outfile.close()
+			if !success {
+				os.rm(temp_path) or {}
+			}
 		}
 	}
 	
@@ -1339,14 +1397,14 @@ password string, seed1 string, seed2 string, mem u32, iter u32, threads u8, pbkd
 	mut t_val := duration_sec
 	if t_val < 2 { t_val = 2 }
 
-	println(term.gray('salty: configuring delay chain (t=${t_val})...'))
+	eprintln(term.gray('salty: configuring delay chain (t=${t_val})...'))
 
 	mut data_a := []u8{cap: password.len + file_salt.len}
 	for b in password.bytes() { data_a << b }
 	for b in file_salt { data_a << b }
 	initial_state := sha3.sum512(data_a)
 
-	println(term.gray('salty: computing delay chain sequential delay...'))
+	eprintln(term.gray('salty: computing delay chain sequential delay...'))
 	w_trapdoor_bytes = run_sequential_delay(initial_state, t_val, true)
 	lock_memory(mut w_trapdoor_bytes)
 	defer { unlock_memory(mut w_trapdoor_bytes); zeroize(mut w_trapdoor_bytes) }
@@ -1498,25 +1556,26 @@ password string, seed1 string, seed2 string, mem u32, iter u32, threads u8, pbkd
 	}
 
 	outfile.flush()
-	outfile.close()
-
-	verify_written_container(temp_path, 262180) or {
-		return error('salty: temporary file verification failed: ${err.msg()}')
-	}
-
-	if os.exists(out_path) {
-		backup_path := out_path + '.bak'
-		os.cp(out_path, backup_path) or {
-			return error('salty: failed to create container backup: ${err.msg()}')
+	if out_path != '-' {
+		outfile.close()
+		verify_written_container(temp_path, 262180) or {
+			return error('salty: temporary file verification failed: ${err.msg()}')
 		}
-		os.mv(temp_path, out_path) or {
-			os.mv(backup_path, out_path) or {}
-			return error('salty: failed to overwrite original container safely: ${err.msg()}')
-		}
-		os.rm(backup_path) or {}
-	} else {
-		os.mv(temp_path, out_path) or {
-			return error('salty: failed to write container to destination: ${err.msg()}')
+
+		if os.exists(out_path) {
+			backup_path := out_path + '.bak'
+			os.cp(out_path, backup_path) or {
+				return error('salty: failed to create container backup: ${err.msg()}')
+			}
+			os.mv(temp_path, out_path) or {
+				os.mv(backup_path, out_path) or {}
+				return error('salty: failed to overwrite original container safely: ${err.msg()}')
+			}
+			os.rm(backup_path) or {}
+		} else {
+			os.mv(temp_path, out_path) or {
+				return error('salty: failed to write container to destination: ${err.msg()}')
+			}
 		}
 	}
 
@@ -1533,7 +1592,7 @@ fn run_mount_flow(container_path string, duration u64, password string, seed1 st
 	$if !windows {
 		uid := C.getuid()
 		if uid != 0 {
-			println(term.gray('salty: administrative privileges (sudo/root) required for system mounts.'))
+			eprintln(term.gray('salty: administrative privileges (sudo/root) required for system mounts.'))
 		}
 	}
 
@@ -1577,7 +1636,7 @@ fn run_mount_flow(container_path string, duration u64, password string, seed1 st
 
 	if os.exists(mount_dir) {
 		if is_mounted(mount_dir) {
-			println(term.gray('salty: active mount found. attempting unmount...'))
+			eprintln(term.gray('salty: active mount found. attempting unmount...'))
 			execute_unmount(mount_dir, '') or {}
 		}
 		if os.exists(mount_dir) {
@@ -1597,14 +1656,14 @@ fn run_mount_flow(container_path string, duration u64, password string, seed1 st
 	lock_memory(mut temp_key)
 	defer { unlock_memory(mut temp_key); zeroize(mut temp_key) }
 
-	println(term.gray('salty: decrypting container...'))
+	eprintln(term.gray('salty: decrypting container...'))
 	decrypted_data := locktime_decrypt_mem(container_path, duration, password, seed1, seed2, pbkdf2_iter)!
 	mut files := deserialize_vfs(decrypted_data, temp_key)!
-	println(term.gray('salty: decryption finished. unpacking...'))
+	eprintln(term.gray('salty: decryption finished. unpacking...'))
 
 	unpack_vfs_to_folder(files, safe_erp, temp_key)!
 
-	println(term.gray('salty: binding mount directories...'))
+	eprintln(term.gray('salty: binding mount directories...'))
 	s_erp := sanitize_path(safe_erp)
 	s_mount := sanitize_path(mount_dir)
 	
@@ -1620,12 +1679,12 @@ fn run_mount_flow(container_path string, duration u64, password string, seed1 st
 	mut clean_exit := false
 	defer {
 		if !clean_exit {
-			println(term.gray('salty: cleanup sequence active...'))
+			eprintln(term.gray('salty: cleanup sequence active...'))
 			execute_unmount(mount_dir, safe_erp) or {}
 		}
 	}
 
-	println('salty: container is mounted at: ${mount_dir}')
+	eprintln('salty: container is mounted at: ${mount_dir}')
 	
 	mut updated_files := []MemFile{}
 	for {
@@ -1634,33 +1693,33 @@ fn run_mount_flow(container_path string, duration u64, password string, seed1 st
 		if action_input.to_lower() == 'abort' {
 			confirm := os.input('Are you absolutely sure you want to discard ALL changes made in this mount? (y/N): ').trim_space().to_lower()
 			if confirm == 'y' {
-				println(term.yellow('salty: discarding changes and unmounting...'))
+				eprintln(term.yellow('salty: discarding changes and unmounting...'))
 				break
 			}
 			continue
 		}
 
-		println(term.gray('salty: reading changes...'))
+		eprintln(term.gray('salty: reading changes...'))
 		updated_files = pack_source_to_vfs(mount_dir, temp_key) or {
-			println(term.red('salty: save failed: could not read updated files from mount point: ${err.msg()}'))
-			println(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue and try again.'))
+			eprintln(term.red('salty: save failed: could not read updated files from mount point: ${err.msg()}'))
+			eprintln(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue and try again.'))
 			continue
 		}
 
-		println(term.gray('salty: encrypting...'))
+		eprintln(term.gray('salty: encrypting...'))
 		serialized := serialize_vfs(mut updated_files, temp_key) or {
-			println(term.red('salty: save failed: could not serialize files: ${err.msg()}'))
-			println(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue and try again.'))
+			eprintln(term.red('salty: save failed: could not serialize files: ${err.msg()}'))
+			eprintln(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue and try again.'))
 			continue
 		}
 		
 		locktime_encrypt_mem(serialized, container_path, duration, password, seed1, seed2, mem, iter, threads, pbkdf2_iter, use_compression) or {
-			println(term.red('salty: save failed: could not encrypt and update container: ${err.msg()}'))
-			println(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue (e.g. check permissions/disk space) and try again.'))
+			eprintln(term.red('salty: save failed: could not encrypt and update container: ${err.msg()}'))
+			eprintln(term.yellow('salty: your changes are safe in the mount directory. Please resolve the issue (e.g. check permissions/disk space) and try again.'))
 			continue
 		}
 		
-		println(term.gray('salty: container updated successfully.'))
+		eprintln(term.gray('salty: container updated successfully.'))
 		break
 	}
 
@@ -1682,12 +1741,14 @@ fn run_mount_flow(container_path string, duration u64, password string, seed1 st
 		zeroize(mut f.enc_data)
 	}
 
-	println(term.gray('salty: unmount completed.'))
+	eprintln(term.gray('salty: unmount completed.'))
 }
 
 fn locktime_encrypt_flow(file_path string, out_path string, duration_sec u64,
 password string, seed1 string, seed2 string, mem u32, iter u32, threads u8, pbkdf2_iter int, shred_orig bool, use_compression bool) ! { 
-	verify_write_permission(out_path)!
+	if out_path != '-' {
+		verify_write_permission(out_path)!
+	}
 
 	mut temp_key := secure_random_bytes(32)!
 	lock_memory(mut temp_key)
@@ -1697,16 +1758,18 @@ password string, seed1 string, seed2 string, mem u32, iter u32, threads u8, pbkd
 	serialized := serialize_vfs(mut files, temp_key)!
 	locktime_encrypt_mem(serialized, out_path, duration_sec, password, seed1, seed2, mem, iter, threads, pbkdf2_iter, use_compression)!
 
-	verify_written_container(out_path, 262180) or {
-		return error('salty: safety check failed. Encrypted container not verified. Original files left untouched. Details: ${err.msg()}')
+	if out_path != '-' {
+		verify_written_container(out_path, 262180) or {
+			return error('salty: safety check failed. Encrypted container not verified. Original files left untouched. Details: ${err.msg()}')
+		}
 	}
 
-	if shred_orig {
+	if shred_orig && file_path != '-' {
 		if os.is_dir(file_path) {
-			println(term.gray('salty: shredding original folder...'))
+			eprintln(term.gray('salty: shredding original folder...'))
 			shred_and_remove_dir_recursive(file_path)!
 		} else {
-			println(term.gray('salty: shredding original file...'))
+			eprintln(term.gray('salty: shredding original file...'))
 			secure_shred_file(file_path)
 		}
 	}
@@ -1714,10 +1777,12 @@ password string, seed1 string, seed2 string, mem u32, iter u32, threads u8, pbkd
 
 fn locktime_decrypt_flow(file_path string, out_path string, duration_sec u64, password string, seed1 string, seed2 string,
 pbkdf2_iter int, shred_orig bool) ! { 
-	if !os.exists(file_path) { return error('salty: input container not found') }
+	if file_path != '-' && !os.exists(file_path) { return error('salty: input container not found') }
 	
-	os.mkdir_all(out_path) or {}
-	check_dir_write_permission(out_path)!
+	if out_path != '-' {
+		os.mkdir_all(out_path) or {}
+		check_dir_write_permission(out_path)!
+	}
 
 	decrypted_data := locktime_decrypt_mem(file_path, duration_sec, password, seed1, seed2, pbkdf2_iter)!
 
@@ -1740,7 +1805,7 @@ pbkdf2_iter int, shred_orig bool) ! {
 		zeroize(mut f.enc_data)
 	}
 
-	if shred_orig {
+	if shred_orig && file_path != '-' {
 		secure_shred_file(file_path)
 	}
 }
@@ -1914,7 +1979,7 @@ fn encrypt_text_stego(message string, cover_text string, password string, seed s
 	}
 	mut real_intensity := intensity
 	if real_intensity > 25 {
-		println(term.gray('salty: warning: stego intensity capped at 25% to prevent detection.'))
+		eprintln(term.gray('salty: warning: stego intensity capped at 25% to prevent detection.'))
 		real_intensity = 25
 	}
 	hex_cipher := encrypt_payload_chacha20(message, password, use_compression)!
@@ -2403,8 +2468,8 @@ fn print_help() {
 	println('  obfuscate                  Apply visual homoglyphs and noise mappings')
 	println('  interactive                Run Salty interactive stego menu')
 	println('\nOptions:')
-	println('  -f, --file <path>          Input folder or container file path')
-	println('  -o, --out <path>           Output container file or decrypted folder path')
+	println('  -f, --file <path>          Input folder, container file path, or "-" for stdin')
+	println('  -o, --out <path>           Output container file, decrypted folder path, or "-" for stdout')
 	println('  -t, --time <iterations>    VDF sequential delay chain iteration count (Default: 100000)')
 	println('  -p, --pass <password>      Master password for cryptographic protection')
 	println('  --seed1 <seed1>            Seed 1 for index shuffling')
@@ -2524,7 +2589,7 @@ fn main() {
 				eprintln('error: unmount failed: ${err}')
 				return
 			}
-			println('salty: cleaned up mount point: "${file_path}"')
+			eprintln('salty: cleaned up mount point: "${file_path}"')
 			return
 		}
 
